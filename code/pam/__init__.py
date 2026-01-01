@@ -14,3 +14,5 @@ from .datasets import (  # noqa: F401
     load_anuraset,
     load_fnjv,
 )
+from .talnet import PamTALNet  # noqa: F401
+from .training import PamTALNetTrainer  # noqa: F401

@@ -16,6 +16,9 @@ TARGET_SPECIES = [
 
 OTHERS = "OTHERS"
 
+# Fixed label order used by the PAM TALNet pipeline (targets + OTHERS).
+PAM_CLASSES = TARGET_SPECIES + [OTHERS]
+
 
 def canonicalize_label(raw_label: str) -> str:
     """Strip any suffix after an underscore from a label.

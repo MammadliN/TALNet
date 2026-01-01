@@ -69,6 +69,20 @@ The PAM workflow replaces the original AudioSet data readers with AnuraSet/FNJV-
 * FNJV is only used for final testing; rows with `Code == IGNORE` or codes outside the target list are excluded.
 * Segment generation supports instances of 1/3/5/10/15/30/60 seconds and bags of 60/120/300/600 seconds; every experiment iterates the full grid in increasing bag length.
 
+TALNet is used for WSSED on the PAM manifests with a 10-class head (nine target species plus `OTHERS`). The `code/pam/training.py` CLI wraps the original TALNet architecture and trains on the generated bag manifests:
+
+```bash
+cd code/pam
+# Example for instance=1s, bag=60s, reading audio from /path/to/wavs
+python training.py \
+  --manifest-root ../../workspace/pam \
+  --config instance1_bag60 \
+  --audio-root /path/to/wavs \
+  --epochs 10 --batch-size 16
+```
+
+This will save TALNet weights (`pam_talnet.pt`) and evaluation metrics (`pam_talnet_metrics.json`) inside the configuration directory after optionally validating on AnuraSet and testing on both AnuraSet and FNJV splits when available.
+
 To prepare manifests for all experiments:
 
 ```bash
