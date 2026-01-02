@@ -9,26 +9,45 @@ purely for final testing and never participates in training or validation.
 
 from __future__ import annotations
 
-import argparse
 import json
 import pathlib
+import sys
 from typing import Dict, Iterable, List, Tuple
 
 import pandas as pd
 
-from .constants import TARGET_SPECIES
-from .datasets import (
-    ClipAnnotation,
-    SplitAssignments,
-    build_anuraset_splits,
-    build_recording_stats,
-    describe_split,
-    df_to_annotations,
-    filter_split,
-    generate_segments,
-    load_anuraset,
-    load_fnjv,
-)
+# Support execution both as a module (python -m code.pam.run_wssed) and as a
+# standalone script (python code/pam/run_wssed.py) without relying on package
+# context in the caller.
+if __package__ in (None, ""):
+    sys.path.append(str(pathlib.Path(__file__).resolve().parent.parent))
+    from pam.constants import TARGET_SPECIES  # type: ignore  # noqa: E402
+    from pam.datasets import (  # type: ignore  # noqa: E402
+        ClipAnnotation,
+        SplitAssignments,
+        build_anuraset_splits,
+        build_recording_stats,
+        describe_split,
+        df_to_annotations,
+        filter_split,
+        generate_segments,
+        load_anuraset,
+        load_fnjv,
+    )
+else:
+    from .constants import TARGET_SPECIES
+    from .datasets import (
+        ClipAnnotation,
+        SplitAssignments,
+        build_anuraset_splits,
+        build_recording_stats,
+        describe_split,
+        df_to_annotations,
+        filter_split,
+        generate_segments,
+        load_anuraset,
+        load_fnjv,
+    )
 
 EXPERIMENT_GRID: List[Tuple[int, int]] = []
 for bag in [60, 120, 300, 600]:
@@ -102,18 +121,60 @@ def _prepare_fnjv(metadata_path: pathlib.Path, output_root: pathlib.Path) -> pd.
     return fnjv_df
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Prepare AnuraSet/FNJV WSSED experiments")
-    parser.add_argument("--anuraset-root", type=pathlib.Path, required=True, help="Directory with AnuraSet CSVs")
-    parser.add_argument("--fnjv-metadata", type=pathlib.Path, required=True, help="Path to metadata_filtered_filled.csv")
-    parser.add_argument("--output-dir", type=pathlib.Path, default=pathlib.Path("../../workspace/pam"))
-    parser.add_argument("--val-size", type=float, default=0.1, help="Fraction of recordings for validation (0 to disable)")
-    parser.add_argument("--test-size", type=float, default=0.2, help="Fraction of recordings for AnuraSet test")
-    parser.add_argument("--random-seed", type=int, default=13)
-    args = parser.parse_args()
+def _usage() -> str:
+    return (
+        "Usage: python -m code.pam.run_wssed --anuraset-root <path> --fnjv-metadata <path> "
+        "[--output-dir <path>] [--val-size <float>] [--test-size <float>] [--random-seed <int>]"
+    )
 
-    splits, anura_df = _prepare_anuraset(args.anuraset_root, args.output_dir, args.val_size, args.test_size, args.random_seed)
-    fnjv_df = _prepare_fnjv(args.fnjv_metadata, args.output_dir)
+
+def _parse_cli(argv: List[str]):
+    if not argv:
+        raise SystemExit(_usage())
+
+    opts = {
+        "anuraset_root": None,
+        "fnjv_metadata": None,
+        "output_dir": pathlib.Path("../../workspace/pam"),
+        "val_size": 0.1,
+        "test_size": 0.2,
+        "random_seed": 13,
+    }
+
+    i = 0
+    while i < len(argv):
+        token = argv[i]
+        if not token.startswith("--"):
+            raise SystemExit(f"Unexpected argument '{token}'. {_usage()}")
+        key = token[2:].replace("-", "_")
+
+        if key not in opts:
+            raise SystemExit(f"Unknown option '{token}'. {_usage()}")
+        if i + 1 >= len(argv):
+            raise SystemExit(f"Missing value for '{token}'. {_usage()}")
+
+        value = argv[i + 1]
+        if key in {"anuraset_root", "fnjv_metadata", "output_dir"}:
+            opts[key] = pathlib.Path(value)
+        elif key in {"val_size", "test_size"}:
+            opts[key] = float(value)
+        elif key == "random_seed":
+            opts[key] = int(value)
+        i += 2
+
+    if opts["anuraset_root"] is None or opts["fnjv_metadata"] is None:
+        raise SystemExit("--anuraset-root and --fnjv-metadata are required. " + _usage())
+
+    return opts
+
+
+def main():
+    args = _parse_cli(sys.argv[1:])
+
+    splits, anura_df = _prepare_anuraset(
+        args["anuraset_root"], args["output_dir"], args["val_size"], args["test_size"], args["random_seed"]
+    )
+    fnjv_df = _prepare_fnjv(args["fnjv_metadata"], args["output_dir"])
 
     print("AnuraSet split sizes (recordings):")
     print({
@@ -125,7 +186,7 @@ def main():
 
     for instance_len, bag_len in EXPERIMENT_GRID:
         cfg_name = f"instance{instance_len}_bag{bag_len}"
-        cfg_dir = args.output_dir / cfg_name
+        cfg_dir = args["output_dir"] / cfg_name
         cfg_dir.mkdir(parents=True, exist_ok=True)
 
         # Build split-specific annotations
