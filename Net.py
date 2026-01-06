@@ -32,7 +32,8 @@ class Net(nn.Module):
         self.__dict__.update(args.__dict__)     # Instill all args into self
         assert self.n_conv_layers % self.n_pool_layers == 0
         self.input_n_freq_bins = n_freq_bins = 64
-        self.output_size = 527
+        # Allow custom label dimensions while keeping the original TALNet architecture intact
+        self.output_size = getattr(args, 'output_size', 527)
         self.conv = []
         pool_interval = self.n_conv_layers / self.n_pool_layers
         n_input = 1
