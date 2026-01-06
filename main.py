@@ -9,7 +9,6 @@ data pipeline to the AnuraSet layout. Configure the defaults inside the
 from __future__ import annotations
 
 import argparse
-import json
 import math
 from dataclasses import dataclass
 from pathlib import Path
@@ -22,7 +21,6 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 
 import librosa
-import wandb
 
 from Net import Net
 
@@ -94,21 +92,6 @@ def _ensure_audio_path(root: Path, row: pd.Series) -> Path:
     # Fall back to first guess even if it does not exist so the caller gets
     # a clear error when attempting to load.
     return candidates[0].with_suffix(".wav")
-
-
-def load_wandb_api_key(secret_path: Path) -> Optional[str]:
-    """Load WANDB_API_KEY from a JSON secrets file if it exists."""
-
-    if not secret_path.exists():
-        return None
-    try:
-        with open(secret_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        key = data.get("WANDB_API_KEY")
-        return key
-    except Exception as exc:  # pragma: no cover - defensive logging
-        print(f"Warning: could not read {secret_path}: {exc}")
-        return None
 
 
 class AnuraSetDataset(Dataset):
@@ -245,32 +228,6 @@ def compute_micro_f1(pred: torch.Tensor, target: torch.Tensor, threshold: float 
     return 0.0 if denom == 0 else float(2 * tp) / float(denom)
 
 
-def init_wandb(run_config: RunConfig, args: argparse.Namespace, num_classes: int):
-    secret_path = Path("wandb_secrets.json")
-    api_key = load_wandb_api_key(secret_path)
-    if api_key:
-        wandb.login(key=api_key)
-
-    run = wandb.init(
-        project="TALNet",
-        entity="WSSED",
-        config={
-            "root": str(run_config.root),
-            "pooling": run_config.pooling,
-            "bag_seconds": run_config.bag_seconds,
-            "target_species": list(run_config.target_species),
-            "epochs": args.epochs,
-            "batch_size": args.batch_size,
-            "learning_rate": args.learning_rate,
-            "num_workers": args.num_workers,
-            "use_batch_generator": args.use_batch_generator,
-            "num_classes": num_classes,
-        },
-        reinit=True,
-    )
-    return run
-
-
 def run_epoch(
     model: Net,
     loader,
@@ -379,7 +336,6 @@ def main(args: argparse.Namespace, run_config: RunConfig) -> None:
     )
 
     output_size = len(train_ds.label_columns)
-    wandb_run = init_wandb(run_config, args, output_size)
     model = build_model(run_config.pooling, output_size, device)
     criterion = nn.BCELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
@@ -393,10 +349,6 @@ def main(args: argparse.Namespace, run_config: RunConfig) -> None:
             model, train_data, optimizer, criterion, device, total_batches=train_batches
         )
         print(f"Epoch {epoch}: train loss={train_loss:.4f}, train micro-F1={train_f1:.4f}")
-        if wandb_run:
-            wandb.log(
-                {"epoch": epoch, "train/loss": train_loss, "train/micro_f1": train_f1}
-            )
 
         if test_loader_info is not None:
             test_loader, test_batches, test_is_gen = test_loader_info
@@ -406,14 +358,6 @@ def main(args: argparse.Namespace, run_config: RunConfig) -> None:
                     model, test_data, None, criterion, device, total_batches=test_batches
                 )
             print(f"           test loss={val_loss:.4f}, test micro-F1={val_f1:.4f}")
-            if wandb_run:
-                wandb.log(
-                    {
-                        "epoch": epoch,
-                        "test/loss": val_loss,
-                        "test/micro_f1": val_f1,
-                    }
-                )
             if val_f1 > best_f1:
                 best_f1 = val_f1
                 torch.save(model.state_dict(), "best_talnet.pt")
@@ -423,10 +367,6 @@ def main(args: argparse.Namespace, run_config: RunConfig) -> None:
                 torch.save(model.state_dict(), "best_talnet.pt")
 
     print("Training finished. Best micro-F1: {:.4f}".format(best_f1))
-    if wandb_run:
-        wandb_run.summary["best_micro_f1"] = best_f1
-        wandb_run.summary["best_pooling"] = run_config.pooling
-        wandb_run.finish()
 
 
 if __name__ == "__main__":

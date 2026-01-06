@@ -62,11 +62,6 @@ python -m pip install --no-cache-dir --upgrade-strategy only-if-needed \
   "torchmetrics==1.8.2" \
   --break-system-packages
 
-echo ">>> [install] Installing Weights & Biases (wandb) for experiment tracking..."
-python -m pip install --no-cache-dir --upgrade-strategy only-if-needed \
-  "wandb" \
-  --break-system-packages
-
 echo ">>> [install] Installing torchaudio (this was missing)..."
 # Do NOT pin a specific version here; let pip match the already-installed torch
 python -m pip install --no-cache-dir --upgrade-strategy only-if-needed \
