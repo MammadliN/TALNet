@@ -65,6 +65,27 @@ def _discover_label_columns(metadata: pd.DataFrame) -> List[str]:
     return [c for c in metadata.columns if c not in RESERVED_COLUMNS]
 
 
+def _select_label_columns(
+    metadata: pd.DataFrame, target_species: Sequence[str]
+) -> List[str]:
+    label_columns = _discover_label_columns(metadata)
+    if not target_species:
+        return label_columns
+
+    filtered = [c for c in label_columns if c in target_species]
+    if not filtered:
+        raise ValueError(
+            "None of the requested target species were found in metadata columns."
+        )
+    missing = [c for c in target_species if c not in filtered]
+    if missing:
+        print(
+            "Warning: the following target species were not present in metadata and will"
+            f" be ignored: {missing}"
+        )
+    return filtered
+
+
 def _ensure_audio_path(root: Path, row: pd.Series) -> Path:
     """Locate the wav file for a metadata row."""
 
@@ -264,6 +285,7 @@ def create_dataloaders(
     root: Path,
     bag_seconds: int,
     batch_size: int,
+    target_species: Sequence[str],
     num_workers: int = 0,
     use_batch_generator: bool = False,
 ) -> Tuple[
@@ -272,7 +294,7 @@ def create_dataloaders(
     Optional[Tuple[Sequence, int, bool]],
 ]:
     metadata = pd.read_csv(root / "metadata.csv")
-    label_columns = _discover_label_columns(metadata)
+    label_columns = _select_label_columns(metadata, target_species)
 
     train_ds = AnuraSetDataset(root, bag_seconds, metadata, label_columns, subset="train")
     test_subset = "test" if "test" in metadata["subset"].unique() else None
@@ -310,11 +332,13 @@ def main(args: argparse.Namespace) -> None:
     print(f"Using AnuraSet root: {ANURASET_ROOT}")
     print(f"Pooling: {POOLING_MODE} | Bag seconds: {BAG_SECONDS}")
     print(f"Device: {device} | Batch generator: {args.use_batch_generator}")
+    print(f"Target species: {args.target_species if args.target_species else 'ALL'}")
 
     train_ds, train_loader_info, test_loader_info = create_dataloaders(
         ANURASET_ROOT,
         BAG_SECONDS,
         batch_size=args.batch_size,
+        target_species=args.target_species,
         num_workers=args.num_workers,
         use_batch_generator=args.use_batch_generator,
     )
@@ -354,6 +378,18 @@ def main(args: argparse.Namespace) -> None:
 
 
 if __name__ == "__main__":
+    TARGET_SPECIES = [
+        "DENMIN",
+        "LEPLAT",
+        "PHYCUV",
+        "SPHSUR",
+        "SCIPER",
+        "BOABIS",
+        "BOAFAB",
+        "LEPPOD",
+        "PHYALB",
+    ]
+
     parser = argparse.ArgumentParser(description="Train TALNet on AnuraSet")
     parser.add_argument("--epochs", type=int, default=300)
     parser.add_argument("--batch_size", type=int, default=4)
@@ -363,6 +399,14 @@ if __name__ == "__main__":
         "--use_batch_generator",
         action="store_true",
         help="Use the lightweight Python batch generator instead of PyTorch DataLoader",
+    )
+    parser.add_argument(
+        "--target_species",
+        nargs="*",
+        default=TARGET_SPECIES,
+        help=(
+            "Target species columns to include; provide none to use all available species"
+        ),
     )
     main(parser.parse_args())
 
