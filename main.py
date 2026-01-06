@@ -1,17 +1,15 @@
 """End-to-end training entrypoint for AnuraSet with TALNet.
 
 This script keeps the TALNet architecture intact while adapting the
-data pipeline to the AnuraSet layout. Configure the three variables
-below (``ANURASET_ROOT``, ``POOLING_MODE``, ``BAG_SECONDS``) and run
-
-    python main.py
-
-to execute the full training and evaluation pipeline.
+data pipeline to the AnuraSet layout. Configure the defaults inside the
+``if __name__ == "__main__"`` block or override them via CLI flags and run
+``python main.py`` to execute the full training and evaluation pipeline.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import math
 from dataclasses import dataclass
 from pathlib import Path
@@ -24,23 +22,9 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 
 import librosa
+import wandb
 
 from Net import Net
-
-
-# ---------------------------------------------------------------------------
-# User-configurable settings
-# ---------------------------------------------------------------------------
-
-# Root directory containing metadata.csv and the four site folders
-# (INCT20955, INCT4, INCT41, INCT17)
-ANURASET_ROOT = Path("/workspace/AnuraSet")
-
-# Pooling choice: one of ["max", "ave", "lin", "exp", "att"]
-POOLING_MODE = "max"
-
-# Non-overlapping bag length in seconds: choose from [3, 10, 15, 30, 60]
-BAG_SECONDS = 10
 
 
 # ---------------------------------------------------------------------------
@@ -57,6 +41,14 @@ RESERVED_COLUMNS = {
     "species_number",
     "subset",
 }
+
+
+@dataclass
+class RunConfig:
+    root: Path
+    pooling: str
+    bag_seconds: int
+    target_species: Sequence[str]
 
 
 def _discover_label_columns(metadata: pd.DataFrame) -> List[str]:
@@ -102,6 +94,21 @@ def _ensure_audio_path(root: Path, row: pd.Series) -> Path:
     # Fall back to first guess even if it does not exist so the caller gets
     # a clear error when attempting to load.
     return candidates[0].with_suffix(".wav")
+
+
+def load_wandb_api_key(secret_path: Path) -> Optional[str]:
+    """Load WANDB_API_KEY from a JSON secrets file if it exists."""
+
+    if not secret_path.exists():
+        return None
+    try:
+        with open(secret_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        key = data.get("WANDB_API_KEY")
+        return key
+    except Exception as exc:  # pragma: no cover - defensive logging
+        print(f"Warning: could not read {secret_path}: {exc}")
+        return None
 
 
 class AnuraSetDataset(Dataset):
@@ -238,6 +245,32 @@ def compute_micro_f1(pred: torch.Tensor, target: torch.Tensor, threshold: float 
     return 0.0 if denom == 0 else float(2 * tp) / float(denom)
 
 
+def init_wandb(run_config: RunConfig, args: argparse.Namespace, num_classes: int):
+    secret_path = Path("wandb_secrets.json")
+    api_key = load_wandb_api_key(secret_path)
+    if api_key:
+        wandb.login(key=api_key)
+
+    run = wandb.init(
+        project="TALNet",
+        entity="WSSED",
+        config={
+            "root": str(run_config.root),
+            "pooling": run_config.pooling,
+            "bag_seconds": run_config.bag_seconds,
+            "target_species": list(run_config.target_species),
+            "epochs": args.epochs,
+            "batch_size": args.batch_size,
+            "learning_rate": args.learning_rate,
+            "num_workers": args.num_workers,
+            "use_batch_generator": args.use_batch_generator,
+            "num_classes": num_classes,
+        },
+        reinit=True,
+    )
+    return run
+
+
 def run_epoch(
     model: Net,
     loader,
@@ -326,25 +359,28 @@ def create_dataloaders(
     return train_ds, train_loader, test_loader
 
 
-def main(args: argparse.Namespace) -> None:
+def main(args: argparse.Namespace, run_config: RunConfig) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    print(f"Using AnuraSet root: {ANURASET_ROOT}")
-    print(f"Pooling: {POOLING_MODE} | Bag seconds: {BAG_SECONDS}")
+    print(f"Using AnuraSet root: {run_config.root}")
+    print(f"Pooling: {run_config.pooling} | Bag seconds: {run_config.bag_seconds}")
     print(f"Device: {device} | Batch generator: {args.use_batch_generator}")
-    print(f"Target species: {args.target_species if args.target_species else 'ALL'}")
+    print(
+        f"Target species: {run_config.target_species if run_config.target_species else 'ALL'}"
+    )
 
     train_ds, train_loader_info, test_loader_info = create_dataloaders(
-        ANURASET_ROOT,
-        BAG_SECONDS,
+        run_config.root,
+        run_config.bag_seconds,
         batch_size=args.batch_size,
-        target_species=args.target_species,
+        target_species=run_config.target_species,
         num_workers=args.num_workers,
         use_batch_generator=args.use_batch_generator,
     )
 
     output_size = len(train_ds.label_columns)
-    model = build_model(POOLING_MODE, output_size, device)
+    wandb_run = init_wandb(run_config, args, output_size)
+    model = build_model(run_config.pooling, output_size, device)
     criterion = nn.BCELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
 
@@ -357,6 +393,10 @@ def main(args: argparse.Namespace) -> None:
             model, train_data, optimizer, criterion, device, total_batches=train_batches
         )
         print(f"Epoch {epoch}: train loss={train_loss:.4f}, train micro-F1={train_f1:.4f}")
+        if wandb_run:
+            wandb.log(
+                {"epoch": epoch, "train/loss": train_loss, "train/micro_f1": train_f1}
+            )
 
         if test_loader_info is not None:
             test_loader, test_batches, test_is_gen = test_loader_info
@@ -366,6 +406,14 @@ def main(args: argparse.Namespace) -> None:
                     model, test_data, None, criterion, device, total_batches=test_batches
                 )
             print(f"           test loss={val_loss:.4f}, test micro-F1={val_f1:.4f}")
+            if wandb_run:
+                wandb.log(
+                    {
+                        "epoch": epoch,
+                        "test/loss": val_loss,
+                        "test/micro_f1": val_f1,
+                    }
+                )
             if val_f1 > best_f1:
                 best_f1 = val_f1
                 torch.save(model.state_dict(), "best_talnet.pt")
@@ -375,9 +423,17 @@ def main(args: argparse.Namespace) -> None:
                 torch.save(model.state_dict(), "best_talnet.pt")
 
     print("Training finished. Best micro-F1: {:.4f}".format(best_f1))
+    if wandb_run:
+        wandb_run.summary["best_micro_f1"] = best_f1
+        wandb_run.summary["best_pooling"] = run_config.pooling
+        wandb_run.finish()
 
 
 if __name__ == "__main__":
+    ANURASET_ROOT = Path(r"/ds-iml/Bioacoustics/AnuraSet/raw_data")
+    DEFAULT_POOLING = "max"
+    DEFAULT_BAG_SECONDS = 10
+
     TARGET_SPECIES = [
         "DENMIN",
         "LEPLAT",
@@ -392,7 +448,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Train TALNet on AnuraSet")
     parser.add_argument("--epochs", type=int, default=300)
-    parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--learning_rate", type=float, default=1e-3)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument(
@@ -408,5 +464,44 @@ if __name__ == "__main__":
             "Target species columns to include; provide none to use all available species"
         ),
     )
-    main(parser.parse_args())
+    parser.add_argument(
+        "--all_species",
+        action="store_true",
+        help="Ignore target species list and train on all available labels",
+    )
+    parser.add_argument(
+        "--root",
+        type=Path,
+        default=None,
+        help="Override AnuraSet root containing metadata.csv and site folders",
+    )
+    parser.add_argument(
+        "--pooling",
+        type=str,
+        default=None,
+        choices=["max", "ave", "lin", "exp", "att"],
+        help="Pooling mode to use for MIL reduction",
+    )
+    parser.add_argument(
+        "--bag_seconds",
+        type=int,
+        default=None,
+        choices=[3, 10, 15, 30, 60],
+        help="Non-overlapping bag duration in seconds",
+    )
+
+    cli_args = parser.parse_args()
+    resolved_root = cli_args.root or ANURASET_ROOT
+    resolved_pooling = cli_args.pooling or DEFAULT_POOLING
+    resolved_bag_seconds = cli_args.bag_seconds or DEFAULT_BAG_SECONDS
+    resolved_species = [] if cli_args.all_species else cli_args.target_species
+
+    run_config = RunConfig(
+        root=resolved_root,
+        pooling=resolved_pooling,
+        bag_seconds=resolved_bag_seconds,
+        target_species=resolved_species,
+    )
+
+    main(cli_args, run_config)
 
