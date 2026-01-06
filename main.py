@@ -219,15 +219,16 @@ def compute_micro_f1(pred: torch.Tensor, target: torch.Tensor, threshold: float 
 
 def run_epoch(
     model: Net,
-    loader: DataLoader,
+    loader,
     optimizer: Optional[torch.optim.Optimizer],
     criterion: nn.Module,
     device: torch.device,
+    total_batches: Optional[int] = None,
 ) -> Tuple[float, float]:
     training = optimizer is not None
     model.train(training)
     epoch_loss = 0.0
-    total_batches = 0
+    batch_counter = 0
     all_preds: List[torch.Tensor] = []
     all_targets: List[torch.Tensor] = []
 
@@ -247,14 +248,15 @@ def run_epoch(
             optimizer.step()
 
         epoch_loss += loss.item()
-        total_batches += 1
+        batch_counter += 1
         all_preds.append(outputs.detach().cpu())
         all_targets.append(batch_y.detach().cpu())
 
     preds = torch.cat(all_preds, dim=0)
     targets = torch.cat(all_targets, dim=0)
     f1 = compute_micro_f1(preds, targets)
-    avg_loss = epoch_loss / max(1, total_batches)
+    batches_used = total_batches if total_batches is not None else batch_counter
+    avg_loss = epoch_loss / max(1, batches_used)
     return avg_loss, f1
 
 
@@ -263,37 +265,58 @@ def create_dataloaders(
     bag_seconds: int,
     batch_size: int,
     num_workers: int = 0,
-) -> Tuple[AnuraSetDataset, DataLoader, Optional[DataLoader]]:
+    use_batch_generator: bool = False,
+) -> Tuple[
+    AnuraSetDataset,
+    Tuple[Sequence, int, bool],
+    Optional[Tuple[Sequence, int, bool]],
+]:
     metadata = pd.read_csv(root / "metadata.csv")
     label_columns = _discover_label_columns(metadata)
 
     train_ds = AnuraSetDataset(root, bag_seconds, metadata, label_columns, subset="train")
     test_subset = "test" if "test" in metadata["subset"].unique() else None
-    test_loader = None
+
+    def _build_loader(ds: AnuraSetDataset, shuffle: bool) -> Tuple[Sequence, int, bool]:
+        if use_batch_generator:
+            total_batches = int(math.ceil(len(ds) / batch_size))
+
+            def generator():
+                indices = np.arange(len(ds))
+                if shuffle:
+                    np.random.shuffle(indices)
+                for start in range(0, len(indices), batch_size):
+                    batch_idx = indices[start : start + batch_size]
+                    batch = [ds[i] for i in batch_idx]
+                    xs, ys = zip(*batch)
+                    yield torch.stack(xs), torch.stack(ys)
+
+            return generator, total_batches, True
+        loader = DataLoader(ds, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers)
+        return loader, len(loader), False
+
+    train_loader = _build_loader(train_ds, shuffle=True)
+    test_loader: Optional[Tuple[Sequence, int, bool]] = None
     if test_subset:
         test_ds = AnuraSetDataset(root, bag_seconds, metadata, label_columns, subset=test_subset)
-        test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers)
+        test_loader = _build_loader(test_ds, shuffle=False)
 
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers)
     return train_ds, train_loader, test_loader
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Train TALNet on AnuraSet")
-    parser.add_argument("--epochs", type=int, default=5)
-    parser.add_argument("--batch_size", type=int, default=8)
-    parser.add_argument("--learning_rate", type=float, default=1e-3)
-    parser.add_argument("--num_workers", type=int, default=2)
-    args = parser.parse_args()
-
+def main(args: argparse.Namespace) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     print(f"Using AnuraSet root: {ANURASET_ROOT}")
     print(f"Pooling: {POOLING_MODE} | Bag seconds: {BAG_SECONDS}")
-    print(f"Device: {device}")
+    print(f"Device: {device} | Batch generator: {args.use_batch_generator}")
 
-    train_ds, train_loader, test_loader = create_dataloaders(
-        ANURASET_ROOT, BAG_SECONDS, batch_size=args.batch_size, num_workers=args.num_workers
+    train_ds, train_loader_info, test_loader_info = create_dataloaders(
+        ANURASET_ROOT,
+        BAG_SECONDS,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        use_batch_generator=args.use_batch_generator,
     )
 
     output_size = len(train_ds.label_columns)
@@ -303,12 +326,21 @@ def main() -> None:
 
     best_f1 = -1.0
     for epoch in range(1, args.epochs + 1):
-        train_loss, train_f1 = run_epoch(model, train_loader, optimizer, criterion, device)
+        train_loader, train_batches, train_is_gen = train_loader_info
+        train_data = train_loader() if train_is_gen else train_loader
+
+        train_loss, train_f1 = run_epoch(
+            model, train_data, optimizer, criterion, device, total_batches=train_batches
+        )
         print(f"Epoch {epoch}: train loss={train_loss:.4f}, train micro-F1={train_f1:.4f}")
 
-        if test_loader is not None:
+        if test_loader_info is not None:
+            test_loader, test_batches, test_is_gen = test_loader_info
+            test_data = test_loader() if test_is_gen else test_loader
             with torch.no_grad():
-                val_loss, val_f1 = run_epoch(model, test_loader, None, criterion, device)
+                val_loss, val_f1 = run_epoch(
+                    model, test_data, None, criterion, device, total_batches=test_batches
+                )
             print(f"           test loss={val_loss:.4f}, test micro-F1={val_f1:.4f}")
             if val_f1 > best_f1:
                 best_f1 = val_f1
@@ -322,5 +354,15 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Train TALNet on AnuraSet")
+    parser.add_argument("--epochs", type=int, default=300)
+    parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--learning_rate", type=float, default=1e-3)
+    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument(
+        "--use_batch_generator",
+        action="store_true",
+        help="Use the lightweight Python batch generator instead of PyTorch DataLoader",
+    )
+    main(parser.parse_args())
 
