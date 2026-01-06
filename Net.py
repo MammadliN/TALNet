@@ -18,7 +18,7 @@ class ConvBlock(nn.Module):
         padding = tuple(x // 2 for x in self.kernel_size)
         self.conv = nn.Conv2d(self.n_input, self.n_output, self.kernel_size, padding = padding, bias = ~batch_norm)
         if batch_norm: self.bn = nn.BatchNorm2d(self.n_output)
-        nn.init.xavier_uniform(self.conv.weight)
+        nn.init.xavier_uniform_(self.conv.weight)
 
     def forward(self, x):
         x = self.conv(x)
@@ -55,13 +55,13 @@ class Net(nn.Module):
         if self.pooling == 'att':
             self.fc_att = nn.Linear(int(self.embedding_size), self.output_size)
         # Better initialization
-        nn.init.orthogonal(self.gru.weight_ih_l0); nn.init.constant(self.gru.bias_ih_l0, 0)
-        nn.init.orthogonal(self.gru.weight_hh_l0); nn.init.constant(self.gru.bias_hh_l0, 0)
-        nn.init.orthogonal(self.gru.weight_ih_l0_reverse); nn.init.constant(self.gru.bias_ih_l0_reverse, 0)
-        nn.init.orthogonal(self.gru.weight_hh_l0_reverse); nn.init.constant(self.gru.bias_hh_l0_reverse, 0)
-        nn.init.xavier_uniform(self.fc_prob.weight); nn.init.constant(self.fc_prob.bias, 0)
+        nn.init.orthogonal_(self.gru.weight_ih_l0); nn.init.constant_(self.gru.bias_ih_l0, 0)
+        nn.init.orthogonal_(self.gru.weight_hh_l0); nn.init.constant_(self.gru.bias_hh_l0, 0)
+        nn.init.orthogonal_(self.gru.weight_ih_l0_reverse); nn.init.constant_(self.gru.bias_ih_l0_reverse, 0)
+        nn.init.orthogonal_(self.gru.weight_hh_l0_reverse); nn.init.constant_(self.gru.bias_hh_l0_reverse, 0)
+        nn.init.xavier_uniform_(self.fc_prob.weight); nn.init.constant_(self.fc_prob.bias, 0)
         if self.pooling == 'att':
-            nn.init.xavier_uniform(self.fc_att.weight); nn.init.constant(self.fc_att.bias, 0)
+            nn.init.xavier_uniform_(self.fc_att.weight); nn.init.constant_(self.fc_att.bias, 0)
 
     def forward(self, x):
         x = x.view((-1, 1, x.size(1), x.size(2)))                                                           # x becomes (batch, channel, time, freq)

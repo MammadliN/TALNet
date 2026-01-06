@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -21,6 +22,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 
 import librosa
+import soundfile as sf
 
 from Net import Net
 
@@ -74,6 +76,38 @@ def _select_label_columns(
             f" be ignored: {missing}"
         )
     return filtered
+
+
+def _load_audio_segment(
+    path: Path, sample_rate: int, start: float, duration: float
+) -> np.ndarray:
+    """Load a mono audio segment, preferring soundfile to avoid audioread fallbacks."""
+
+    start_frame = int(round(start * sample_rate))
+    frame_count = int(round(duration * sample_rate))
+
+    try:
+        audio, sr = sf.read(
+            path,
+            start=start_frame,
+            frames=frame_count,
+            dtype="float32",
+            always_2d=False,
+        )
+        if sr != sample_rate:
+            audio = librosa.resample(audio, orig_sr=sr, target_sr=sample_rate)
+        if audio.ndim > 1:
+            audio = audio.mean(axis=1)
+        return audio
+    except Exception as exc:  # pragma: no cover - fallback path
+        warnings.warn(
+            f"soundfile failed for {path} ({exc}); falling back to librosa.load",
+            RuntimeWarning,
+        )
+        audio, _ = librosa.load(
+            path, sr=sample_rate, offset=start, duration=duration, mono=True
+        )
+        return audio
 
 
 def _ensure_audio_path(root: Path, row: pd.Series) -> Path:
@@ -162,12 +196,11 @@ class AnuraSetDataset(Dataset):
 
     def __getitem__(self, index: int) -> Tuple[torch.Tensor, torch.Tensor]:
         item = self.items[index]
-        y, _ = librosa.load(
+        y = _load_audio_segment(
             item["audio_path"],
-            sr=self.sample_rate,
-            offset=item["start"],
+            sample_rate=self.sample_rate,
+            start=item["start"],
             duration=self.bag_seconds,
-            mono=True,
         )
 
         expected_len = int(self.sample_rate * self.bag_seconds)
