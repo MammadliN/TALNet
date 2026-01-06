@@ -15,7 +15,8 @@ class ConvBlock(nn.Module):
         self.pool_stride = pool_stride
         # "~batch_norm" should be written as "not batch_norm"; otherwise ~True will evaluate to -2 and be treated as True.
         # But I'll keep this error to avoid breaking existing models.
-        self.conv = nn.Conv2d(self.n_input, self.n_output, self.kernel_size, padding = tuple(x/2 for x in self.kernel_size), bias = ~batch_norm)
+        padding = tuple(x // 2 for x in self.kernel_size)
+        self.conv = nn.Conv2d(self.n_input, self.n_output, self.kernel_size, padding = padding, bias = ~batch_norm)
         if batch_norm: self.bn = nn.BatchNorm2d(self.n_output)
         nn.init.xavier_uniform(self.conv.weight)
 
@@ -35,24 +36,24 @@ class Net(nn.Module):
         # Allow custom label dimensions while keeping the original TALNet architecture intact
         self.output_size = getattr(args, 'output_size', 527)
         self.conv = []
-        pool_interval = self.n_conv_layers / self.n_pool_layers
+        pool_interval = self.n_conv_layers // self.n_pool_layers
         n_input = 1
         for i in range(self.n_conv_layers):
             if (i + 1) % pool_interval == 0:        # this layer has pooling
-                n_freq_bins /= 2
-                n_output = self.embedding_size / n_freq_bins
+                n_freq_bins //= 2
+                n_output = int(self.embedding_size // n_freq_bins)
                 pool_stride = (2, 2) if i < pool_interval * 2 else (1, 2)
             else:
-                n_output = self.embedding_size * 2 / n_freq_bins
+                n_output = int(self.embedding_size * 2 // n_freq_bins)
                 pool_stride = None
             layer = ConvBlock(n_input, n_output, self.kernel_size, batch_norm = self.batch_norm, pool_stride = pool_stride)
             self.conv.append(layer)
             self.__setattr__('conv' + str(i + 1), layer)
             n_input = n_output
-        self.gru = nn.GRU(self.embedding_size, self.embedding_size / 2, 1, batch_first = True, bidirectional = True)
-        self.fc_prob = nn.Linear(self.embedding_size, self.output_size)
+        self.gru = nn.GRU(self.embedding_size, int(self.embedding_size // 2), 1, batch_first = True, bidirectional = True)
+        self.fc_prob = nn.Linear(int(self.embedding_size), self.output_size)
         if self.pooling == 'att':
-            self.fc_att = nn.Linear(self.embedding_size, self.output_size)
+            self.fc_att = nn.Linear(int(self.embedding_size), self.output_size)
         # Better initialization
         nn.init.orthogonal(self.gru.weight_ih_l0); nn.init.constant(self.gru.bias_ih_l0, 0)
         nn.init.orthogonal(self.gru.weight_hh_l0); nn.init.constant(self.gru.bias_hh_l0, 0)
