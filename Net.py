@@ -54,6 +54,8 @@ class Net(nn.Module):
         self.fc_prob = nn.Linear(int(self.embedding_size), self.output_size)
         if self.pooling == 'att':
             self.fc_att = nn.Linear(int(self.embedding_size), self.output_size)
+        if self.pooling == 'autopool':
+            self.autopool_kernel = nn.Parameter(torch.zeros(1, self.output_size))
         # Better initialization
         nn.init.orthogonal_(self.gru.weight_ih_l0); nn.init.constant_(self.gru.bias_ih_l0, 0)
         nn.init.orthogonal_(self.gru.weight_hh_l0); nn.init.constant_(self.gru.bias_hh_l0, 0)
@@ -81,11 +83,19 @@ class Net(nn.Module):
         elif self.pooling == 'ave':
             global_prob = frame_prob.mean(dim = 1)
             return global_prob, frame_prob
+        elif self.pooling == 'softmax':
+            frame_att = F.softmax(frame_prob, dim = 1)
+            global_prob = (frame_prob * frame_att).sum(dim = 1)
+            return global_prob, frame_prob
         elif self.pooling == 'lin':
             global_prob = (frame_prob * frame_prob).sum(dim = 1) / frame_prob.sum(dim = 1)
             return global_prob, frame_prob
         elif self.pooling == 'exp':
             global_prob = (frame_prob * frame_prob.exp()).sum(dim = 1) / frame_prob.exp().sum(dim = 1)
+            return global_prob, frame_prob
+        elif self.pooling == 'autopool':
+            frame_att = F.softmax(self.autopool_kernel * frame_prob, dim = 1)
+            global_prob = (frame_prob * frame_att).sum(dim = 1)
             return global_prob, frame_prob
         elif self.pooling == 'att':
             frame_att = F.softmax(self.fc_att(x), dim = 1)

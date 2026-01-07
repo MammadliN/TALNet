@@ -452,7 +452,7 @@ if __name__ == "__main__":
         "--pooling",
         type=str,
         default=None,
-        choices=["max", "ave", "lin", "exp", "att"],
+        choices=["max", "ave", "lin", "exp", "att", "softmax", "autopool"],
         help="Pooling mode to use for MIL reduction",
     )
     parser.add_argument(
@@ -477,4 +477,3 @@ if __name__ == "__main__":
     )
 
     main(cli_args, run_config)
-
