@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.autograd import Variable
 import numpy
+from pooling import AutoPool1D, PowerPool1D, BetaExpPool1D
 
 class ConvBlock(nn.Module):
     def __init__(self, n_input_feature_maps, n_output_feature_maps, kernel_size, batch_norm = False, pool_stride = None):
@@ -55,7 +56,11 @@ class Net(nn.Module):
         if self.pooling == 'att':
             self.fc_att = nn.Linear(int(self.embedding_size), self.output_size)
         if self.pooling == 'autopool':
-            self.autopool_kernel = nn.Parameter(torch.zeros(1, self.output_size))
+            self.autopool = AutoPool1D(axis = 1, init = "zeros")
+        if self.pooling == 'powerpool':
+            self.powerpool = PowerPool1D(axis = 1)
+        if self.pooling == 'betaexp':
+            self.betaexp = BetaExpPool1D(axis = 1)
         # Better initialization
         nn.init.orthogonal_(self.gru.weight_ih_l0); nn.init.constant_(self.gru.bias_ih_l0, 0)
         nn.init.orthogonal_(self.gru.weight_hh_l0); nn.init.constant_(self.gru.bias_hh_l0, 0)
@@ -94,8 +99,13 @@ class Net(nn.Module):
             global_prob = (frame_prob * frame_prob.exp()).sum(dim = 1) / frame_prob.exp().sum(dim = 1)
             return global_prob, frame_prob
         elif self.pooling == 'autopool':
-            frame_att = F.softmax(self.autopool_kernel * frame_prob, dim = 1)
-            global_prob = (frame_prob * frame_att).sum(dim = 1)
+            global_prob = self.autopool(frame_prob)
+            return global_prob, frame_prob
+        elif self.pooling == 'powerpool':
+            global_prob = self.powerpool(frame_prob)
+            return global_prob, frame_prob
+        elif self.pooling == 'betaexp':
+            global_prob = self.betaexp(frame_prob)
             return global_prob, frame_prob
         elif self.pooling == 'att':
             frame_att = F.softmax(self.fc_att(x), dim = 1)
