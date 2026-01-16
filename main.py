@@ -589,12 +589,12 @@ def main(args: argparse.Namespace, run_config: RunConfig) -> None:
 
     global_threshold = find_best_global_threshold(val_global, val_targets)
     per_class_tagging_thresholds = find_best_per_class_thresholds(val_global, val_targets)
-    per_class_loc_thresholds = find_best_per_class_thresholds(
+    per_class_segment_thresholds = find_best_per_class_thresholds(
         val_frame.reshape(-1, val_frame.size(-1)),
         val_frame_targets.reshape(-1, val_frame_targets.size(-1)),
     )
 
-    methods = ["global", "per_class"]
+    methods = ["global", "per_class", "segment"]
     if run_config.threshold_method != "both":
         methods = [run_config.threshold_method]
 
@@ -622,13 +622,22 @@ def main(args: argparse.Namespace, run_config: RunConfig) -> None:
             tag_fn = ((1 - tag_preds) * tag_truth).sum()
             tag_denom = (2 * tag_tp + tag_fp + tag_fn)
             tag_f1 = 0.0 if tag_denom == 0 else float(2 * tag_tp) / float(tag_denom)
-            frame_f1 = compute_macro_f1(
-                test_frame.reshape(-1, test_frame.size(-1)),
-                test_frame_targets.reshape(-1, test_frame_targets.size(-1)),
-                per_class_loc_thresholds,
-            )
+            if method == "per_class":
+                frame_f1 = compute_macro_f1(
+                    test_frame.reshape(-1, test_frame.size(-1)),
+                    test_frame_targets.reshape(-1, test_frame_targets.size(-1)),
+                    per_class_tagging_thresholds,
+                )
+                label = "per-class threshold"
+            else:
+                frame_f1 = compute_macro_f1(
+                    test_frame.reshape(-1, test_frame.size(-1)),
+                    test_frame_targets.reshape(-1, test_frame_targets.size(-1)),
+                    per_class_segment_thresholds,
+                )
+                label = "segment-level threshold"
             print(
-                f"[per-class threshold] tagging micro-F1={tag_f1:.4f} | "
+                f"[{label}] tagging micro-F1={tag_f1:.4f} | "
                 f"localization macro-F1={frame_f1:.4f}"
             )
 
@@ -699,7 +708,7 @@ if __name__ == "__main__":
         "--threshold_method",
         type=str,
         default=THRESHOLD_METHOD,
-        choices=["global", "per_class", "both"],
+        choices=["global", "per_class", "segment", "both"],
         help="Threshold strategy for tagging/localization evaluation",
     )
     parser.add_argument(
