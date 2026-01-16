@@ -22,6 +22,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 
 import librosa
+import matplotlib.pyplot as plt
 import soundfile as sf
 
 from Net import Net
@@ -270,14 +271,73 @@ def build_model(pooling: str, output_size: int, device: torch.device) -> Net:
     return model
 
 
-def compute_micro_f1(pred: torch.Tensor, target: torch.Tensor, threshold: float = 0.5) -> float:
-    pred_bin = (pred >= threshold).int()
-    target_bin = (target >= 0.5).int()
-    tp = (pred_bin * target_bin).sum().item()
-    fp = (pred_bin * (1 - target_bin)).sum().item()
-    fn = ((1 - pred_bin) * target_bin).sum().item()
-    denom = (2 * tp + fp + fn)
-    return 0.0 if denom == 0 else float(2 * tp) / float(denom)
+def _binarize_predictions(
+    preds: np.ndarray, thresholds: np.ndarray | float
+) -> np.ndarray:
+    if isinstance(thresholds, np.ndarray):
+        return (preds >= thresholds).astype(np.int32)
+    return (preds >= thresholds).astype(np.int32)
+
+
+def compute_classification_metrics(
+    preds: torch.Tensor, targets: torch.Tensor, thresholds: np.ndarray | float
+) -> Dict[str, float]:
+    preds_np = preds.detach().cpu().numpy()
+    targets_np = (targets.detach().cpu().numpy() >= 0.5).astype(np.int32)
+    pred_bin = _binarize_predictions(preds_np, thresholds)
+
+    tp = (pred_bin * targets_np).sum()
+    fp = (pred_bin * (1 - targets_np)).sum()
+    fn = ((1 - pred_bin) * targets_np).sum()
+    micro_precision = 0.0 if (tp + fp) == 0 else float(tp) / float(tp + fp)
+    micro_recall = 0.0 if (tp + fn) == 0 else float(tp) / float(tp + fn)
+    micro_f1 = (
+        0.0
+        if (2 * tp + fp + fn) == 0
+        else float(2 * tp) / float(2 * tp + fp + fn)
+    )
+
+    macro_precision = []
+    macro_recall = []
+    macro_f1 = []
+    for idx in range(preds_np.shape[1]):
+        pred_c = pred_bin[:, idx]
+        targ_c = targets_np[:, idx]
+        tp_c = (pred_c * targ_c).sum()
+        fp_c = (pred_c * (1 - targ_c)).sum()
+        fn_c = ((1 - pred_c) * targ_c).sum()
+        prec_c = 0.0 if (tp_c + fp_c) == 0 else float(tp_c) / float(tp_c + fp_c)
+        rec_c = 0.0 if (tp_c + fn_c) == 0 else float(tp_c) / float(tp_c + fn_c)
+        f1_c = (
+            0.0
+            if (2 * tp_c + fp_c + fn_c) == 0
+            else float(2 * tp_c) / float(2 * tp_c + fp_c + fn_c)
+        )
+        macro_precision.append(prec_c)
+        macro_recall.append(rec_c)
+        macro_f1.append(f1_c)
+
+    macro_precision_val = float(np.mean(macro_precision)) if macro_precision else 0.0
+    macro_recall_val = float(np.mean(macro_recall)) if macro_recall else 0.0
+    macro_f1_val = float(np.mean(macro_f1)) if macro_f1 else 0.0
+
+    ntrue = targets_np.sum(axis=1)
+    npred = pred_bin.sum(axis=1)
+    ncorr = (pred_bin & targets_np).sum(axis=1)
+    nmiss = ntrue - ncorr
+    nfa = npred - ncorr
+    denom = ntrue.sum()
+    er = 0.0 if denom == 0 else float(np.maximum(nmiss, nfa).sum()) / float(denom)
+
+    return {
+        "micro_precision": micro_precision,
+        "micro_recall": micro_recall,
+        "micro_f1": micro_f1,
+        "macro_precision": macro_precision_val,
+        "macro_recall": macro_recall_val,
+        "macro_f1": macro_f1_val,
+        "er": er,
+    }
 
 
 def _best_threshold(scores: np.ndarray, targets: np.ndarray) -> float:
@@ -315,21 +375,6 @@ def find_best_per_class_thresholds(preds: torch.Tensor, targets: torch.Tensor) -
     return thresholds
 
 
-def compute_macro_f1(pred: torch.Tensor, target: torch.Tensor, thresholds: np.ndarray) -> float:
-    preds = pred.detach().cpu().numpy()
-    truths = target.detach().cpu().numpy().astype(bool)
-    f1s: List[float] = []
-    for idx in range(preds.shape[1]):
-        pred_bin = preds[:, idx] >= thresholds[idx]
-        truth_bin = truths[:, idx]
-        tp = np.logical_and(pred_bin, truth_bin).sum()
-        fp = np.logical_and(pred_bin, ~truth_bin).sum()
-        fn = np.logical_and(~pred_bin, truth_bin).sum()
-        denom = (2 * tp + fp + fn)
-        f1s.append(0.0 if denom == 0 else (2.0 * tp) / denom)
-    return float(np.mean(f1s)) if f1s else 0.0
-
-
 def run_epoch(
     model: Net,
     loader,
@@ -337,7 +382,7 @@ def run_epoch(
     criterion: nn.Module,
     device: torch.device,
     total_batches: Optional[int] = None,
-) -> Tuple[float, float]:
+) -> Tuple[float, Dict[str, float]]:
     training = optimizer is not None
     model.train(training)
     epoch_loss = 0.0
@@ -367,10 +412,10 @@ def run_epoch(
 
     preds = torch.cat(all_preds, dim=0)
     targets = torch.cat(all_targets, dim=0)
-    f1 = compute_micro_f1(preds, targets)
+    metrics = compute_classification_metrics(preds, targets, thresholds=0.5)
     batches_used = total_batches if total_batches is not None else batch_counter
     avg_loss = epoch_loss / max(1, batches_used)
-    return avg_loss, f1
+    return avg_loss, metrics
 
 
 def collect_outputs(
@@ -547,25 +592,118 @@ def main(args: argparse.Namespace, run_config: RunConfig) -> None:
     optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
 
     best_f1 = -1.0
+    history: Dict[str, Dict[str, List[float]]] = {
+        "train": {
+            "loss": [],
+            "micro_f1": [],
+            "macro_f1": [],
+            "micro_precision": [],
+            "micro_recall": [],
+            "macro_precision": [],
+            "macro_recall": [],
+            "er": [],
+        },
+        "val": {
+            "loss": [],
+            "micro_f1": [],
+            "macro_f1": [],
+            "micro_precision": [],
+            "micro_recall": [],
+            "macro_precision": [],
+            "macro_recall": [],
+            "er": [],
+        },
+    }
+
+    def _append_history(split: str, loss: float, metrics: Dict[str, float]) -> None:
+        history[split]["loss"].append(loss)
+        history[split]["micro_f1"].append(metrics["micro_f1"])
+        history[split]["macro_f1"].append(metrics["macro_f1"])
+        history[split]["micro_precision"].append(metrics["micro_precision"])
+        history[split]["micro_recall"].append(metrics["micro_recall"])
+        history[split]["macro_precision"].append(metrics["macro_precision"])
+        history[split]["macro_recall"].append(metrics["macro_recall"])
+        history[split]["er"].append(metrics["er"])
+
+    def _plot_history(output_path: Path) -> None:
+        epochs = np.arange(1, len(history["train"]["loss"]) + 1)
+        fig, axes = plt.subplots(4, 2, figsize=(14, 16))
+        axes = axes.flatten()
+
+        def plot_metric(
+            ax, metric: str, title: str, ylim: Optional[Tuple[float, float]] = None
+        ) -> None:
+            ax.plot(epochs, history["train"][metric], label="train")
+            ax.plot(epochs, history["val"][metric], label="val")
+            ax.set_title(title)
+            ax.set_xlabel("Epoch")
+            ax.set_ylabel(metric.replace("_", " "))
+            if ylim is not None:
+                ax.set_ylim(*ylim)
+            ax.grid(True, alpha=0.3)
+            ax.legend()
+
+        plot_metric(axes[0], "loss", "Loss")
+        plot_metric(axes[1], "micro_f1", "Micro F1", ylim=(0.0, 1.0))
+        plot_metric(axes[2], "macro_f1", "Macro F1", ylim=(0.0, 1.0))
+        plot_metric(axes[3], "micro_precision", "Micro Precision", ylim=(0.0, 1.0))
+        plot_metric(axes[4], "micro_recall", "Micro Recall", ylim=(0.0, 1.0))
+        plot_metric(axes[5], "macro_precision", "Macro Precision", ylim=(0.0, 1.0))
+        plot_metric(axes[6], "macro_recall", "Macro Recall", ylim=(0.0, 1.0))
+        plot_metric(axes[7], "er", "Error Rate")
+
+        fig.tight_layout()
+        fig.savefig(output_path)
+        plt.close(fig)
     for epoch in range(1, args.epochs + 1):
         train_loader, train_batches, train_is_gen = train_loader_info
         train_data = train_loader() if train_is_gen else train_loader
 
-        train_loss, train_f1 = run_epoch(
+        train_loss, train_metrics = run_epoch(
             model, train_data, optimizer, criterion, device, total_batches=train_batches
         )
-        print(f"Epoch {epoch}: train loss={train_loss:.4f}, train micro-F1={train_f1:.4f}")
+        _append_history("train", train_loss, train_metrics)
+        print(
+            "Epoch {epoch}: train loss={loss:.4f}, micro-P={mp:.4f}, micro-R={mr:.4f}, "
+            "micro-F1={mf1:.4f}, macro-P={Mp:.4f}, macro-R={Mr:.4f}, macro-F1={Mf1:.4f}, "
+            "ER={er:.4f}".format(
+                epoch=epoch,
+                loss=train_loss,
+                mp=train_metrics["micro_precision"],
+                mr=train_metrics["micro_recall"],
+                mf1=train_metrics["micro_f1"],
+                Mp=train_metrics["macro_precision"],
+                Mr=train_metrics["macro_recall"],
+                Mf1=train_metrics["macro_f1"],
+                er=train_metrics["er"],
+            )
+        )
 
         val_loader, val_batches, val_is_gen = val_loader_info
         val_data = val_loader() if val_is_gen else val_loader
         with torch.no_grad():
-            val_loss, val_f1 = run_epoch(
+            val_loss, val_metrics = run_epoch(
                 model, val_data, None, criterion, device, total_batches=val_batches
             )
-        print(f"           val loss={val_loss:.4f}, val micro-F1={val_f1:.4f}")
-        if val_f1 > best_f1:
-            best_f1 = val_f1
+        _append_history("val", val_loss, val_metrics)
+        print(
+            "           val loss={loss:.4f}, micro-P={mp:.4f}, micro-R={mr:.4f}, "
+            "micro-F1={mf1:.4f}, macro-P={Mp:.4f}, macro-R={Mr:.4f}, macro-F1={Mf1:.4f}, "
+            "ER={er:.4f}".format(
+                loss=val_loss,
+                mp=val_metrics["micro_precision"],
+                mr=val_metrics["micro_recall"],
+                mf1=val_metrics["micro_f1"],
+                Mp=val_metrics["macro_precision"],
+                Mr=val_metrics["macro_recall"],
+                Mf1=val_metrics["macro_f1"],
+                er=val_metrics["er"],
+            )
+        )
+        if val_metrics["micro_f1"] > best_f1:
+            best_f1 = val_metrics["micro_f1"]
             torch.save(model.state_dict(), "best_talnet.pt")
+        _plot_history(Path("training_metrics.png"))
 
     print("Training finished. Best micro-F1: {:.4f}".format(best_f1))
 
@@ -595,50 +733,86 @@ def main(args: argparse.Namespace, run_config: RunConfig) -> None:
     )
 
     methods = ["global", "per_class", "segment"]
-    if run_config.threshold_method != "both":
+    if run_config.threshold_method != "all":
         methods = [run_config.threshold_method]
 
     for method in methods:
         if method == "global":
-            tag_f1 = compute_micro_f1(test_global, test_targets, threshold=global_threshold)
-            frame_preds = (test_frame >= global_threshold).int()
-            frame_truth = (test_frame_targets >= 0.5).int()
-            frame_f1 = compute_micro_f1(
-                frame_preds.view(-1, frame_preds.size(-1)),
-                frame_truth.view(-1, frame_truth.size(-1)),
-                threshold=0.5,
+            tag_metrics = compute_classification_metrics(
+                test_global, test_targets, thresholds=global_threshold
+            )
+            frame_metrics = compute_classification_metrics(
+                test_frame.reshape(-1, test_frame.size(-1)),
+                test_frame_targets.reshape(-1, test_frame_targets.size(-1)),
+                thresholds=global_threshold,
             )
             print(
-                f"[global threshold] tagging micro-F1={tag_f1:.4f} | "
-                f"localization micro-F1={frame_f1:.4f}"
+                "[global threshold] tagging micro-P={mp:.4f} micro-R={mr:.4f} micro-F1={mf1:.4f} "
+                "macro-P={Mp:.4f} macro-R={Mr:.4f} macro-F1={Mf1:.4f} ER={er:.4f}".format(
+                    mp=tag_metrics["micro_precision"],
+                    mr=tag_metrics["micro_recall"],
+                    mf1=tag_metrics["micro_f1"],
+                    Mp=tag_metrics["macro_precision"],
+                    Mr=tag_metrics["macro_recall"],
+                    Mf1=tag_metrics["macro_f1"],
+                    er=tag_metrics["er"],
+                )
+            )
+            print(
+                "[global threshold] localization micro-P={mp:.4f} micro-R={mr:.4f} micro-F1={mf1:.4f} "
+                "macro-P={Mp:.4f} macro-R={Mr:.4f} macro-F1={Mf1:.4f} ER={er:.4f}".format(
+                    mp=frame_metrics["micro_precision"],
+                    mr=frame_metrics["micro_recall"],
+                    mf1=frame_metrics["micro_f1"],
+                    Mp=frame_metrics["macro_precision"],
+                    Mr=frame_metrics["macro_recall"],
+                    Mf1=frame_metrics["macro_f1"],
+                    er=frame_metrics["er"],
+                )
             )
         else:
-            tag_preds = (test_global.detach().cpu().numpy() >= per_class_tagging_thresholds).astype(
-                np.int32
+            tag_metrics = compute_classification_metrics(
+                test_global, test_targets, thresholds=per_class_tagging_thresholds
             )
-            tag_truth = (test_targets.detach().cpu().numpy() >= 0.5).astype(np.int32)
-            tag_tp = (tag_preds * tag_truth).sum()
-            tag_fp = (tag_preds * (1 - tag_truth)).sum()
-            tag_fn = ((1 - tag_preds) * tag_truth).sum()
-            tag_denom = (2 * tag_tp + tag_fp + tag_fn)
-            tag_f1 = 0.0 if tag_denom == 0 else float(2 * tag_tp) / float(tag_denom)
             if method == "per_class":
-                frame_f1 = compute_macro_f1(
+                frame_metrics = compute_classification_metrics(
                     test_frame.reshape(-1, test_frame.size(-1)),
                     test_frame_targets.reshape(-1, test_frame_targets.size(-1)),
-                    per_class_tagging_thresholds,
+                    thresholds=per_class_tagging_thresholds,
                 )
                 label = "per-class threshold"
             else:
-                frame_f1 = compute_macro_f1(
+                frame_metrics = compute_classification_metrics(
                     test_frame.reshape(-1, test_frame.size(-1)),
                     test_frame_targets.reshape(-1, test_frame_targets.size(-1)),
-                    per_class_segment_thresholds,
+                    thresholds=per_class_segment_thresholds,
                 )
                 label = "segment-level threshold"
             print(
-                f"[{label}] tagging micro-F1={tag_f1:.4f} | "
-                f"localization macro-F1={frame_f1:.4f}"
+                "[{label}] tagging micro-P={mp:.4f} micro-R={mr:.4f} micro-F1={mf1:.4f} "
+                "macro-P={Mp:.4f} macro-R={Mr:.4f} macro-F1={Mf1:.4f} ER={er:.4f}".format(
+                    label=label,
+                    mp=tag_metrics["micro_precision"],
+                    mr=tag_metrics["micro_recall"],
+                    mf1=tag_metrics["micro_f1"],
+                    Mp=tag_metrics["macro_precision"],
+                    Mr=tag_metrics["macro_recall"],
+                    Mf1=tag_metrics["macro_f1"],
+                    er=tag_metrics["er"],
+                )
+            )
+            print(
+                "[{label}] localization micro-P={mp:.4f} micro-R={mr:.4f} micro-F1={mf1:.4f} "
+                "macro-P={Mp:.4f} macro-R={Mr:.4f} macro-F1={Mf1:.4f} ER={er:.4f}".format(
+                    label=label,
+                    mp=frame_metrics["micro_precision"],
+                    mr=frame_metrics["micro_recall"],
+                    mf1=frame_metrics["micro_f1"],
+                    Mp=frame_metrics["macro_precision"],
+                    Mr=frame_metrics["macro_recall"],
+                    Mf1=frame_metrics["macro_f1"],
+                    er=frame_metrics["er"],
+                )
             )
 
 
@@ -648,7 +822,7 @@ if __name__ == "__main__":
     DEFAULT_POOLING = "max"
     DEFAULT_BAG_SECONDS = 10
     DATASET_NAME = "AnuraSet"
-    THRESHOLD_METHOD = "both"
+    THRESHOLD_METHOD = "all"
 
     TARGET_SPECIES = [
         "DENMIN",
@@ -663,7 +837,7 @@ if __name__ == "__main__":
     ]
 
     parser = argparse.ArgumentParser(description="Train TALNet on AnuraSet")
-    parser.add_argument("--epochs", type=int, default=300)
+    parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--learning_rate", type=float, default=1e-3)
     parser.add_argument("--num_workers", type=int, default=4)
@@ -708,7 +882,7 @@ if __name__ == "__main__":
         "--threshold_method",
         type=str,
         default=THRESHOLD_METHOD,
-        choices=["global", "per_class", "segment", "both"],
+        choices=["global", "per_class", "segment", "all"],
         help="Threshold strategy for tagging/localization evaluation",
     )
     parser.add_argument(
