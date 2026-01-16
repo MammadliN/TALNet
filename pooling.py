@@ -17,7 +17,9 @@ def _make_feature_param(name: str, module: nn.Module, feature_dim: int, init: st
         p = nn.Parameter(torch.zeros(1, feature_dim))
     else:
         p = nn.Parameter(torch.ones(1, feature_dim))
-    module.register_parameter(name, p)
+    if hasattr(module, name):
+        delattr(module, name)
+    setattr(module, name, p)
     return p
 
 
