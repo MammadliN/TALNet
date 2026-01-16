@@ -90,17 +90,27 @@ def _load_audio_segment(
     frame_count = int(round(duration * sample_rate))
 
     try:
+        info = sf.info(path)
+        native_sr = info.samplerate
+        total_frames = info.frames
+
+        if start_frame >= total_frames:
+            return np.zeros(frame_count, dtype=np.float32)
+
+        frames_to_read = min(frame_count, total_frames - start_frame)
         audio, sr = sf.read(
             path,
             start=start_frame,
-            frames=frame_count,
+            frames=frames_to_read,
             dtype="float32",
             always_2d=False,
         )
-        if sr != sample_rate:
-            audio = librosa.resample(audio, orig_sr=sr, target_sr=sample_rate)
         if audio.ndim > 1:
             audio = audio.mean(axis=1)
+        if sr != sample_rate:
+            audio = librosa.resample(audio, orig_sr=sr, target_sr=sample_rate)
+        if len(audio) < frame_count:
+            audio = np.pad(audio, (0, frame_count - len(audio)), mode="constant")
         return audio
     except Exception as exc:  # pragma: no cover - fallback path
         warnings.warn(
@@ -110,6 +120,8 @@ def _load_audio_segment(
         audio, _ = librosa.load(
             path, sr=sample_rate, offset=start, duration=duration, mono=True
         )
+        if len(audio) < frame_count:
+            audio = np.pad(audio, (0, frame_count - len(audio)), mode="constant")
         return audio
 
 
