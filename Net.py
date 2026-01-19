@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.autograd import Variable
 import numpy
+from pooling import AutoPool1D, PowerPool1D, BetaExpPool1D
 
 class ConvBlock(nn.Module):
     def __init__(self, n_input_feature_maps, n_output_feature_maps, kernel_size, batch_norm = False, pool_stride = None):
@@ -15,9 +16,10 @@ class ConvBlock(nn.Module):
         self.pool_stride = pool_stride
         # "~batch_norm" should be written as "not batch_norm"; otherwise ~True will evaluate to -2 and be treated as True.
         # But I'll keep this error to avoid breaking existing models.
-        self.conv = nn.Conv2d(self.n_input, self.n_output, self.kernel_size, padding = tuple(x/2 for x in self.kernel_size), bias = ~batch_norm)
+        padding = tuple(x // 2 for x in self.kernel_size)
+        self.conv = nn.Conv2d(self.n_input, self.n_output, self.kernel_size, padding = padding, bias = ~batch_norm)
         if batch_norm: self.bn = nn.BatchNorm2d(self.n_output)
-        nn.init.xavier_uniform(self.conv.weight)
+        nn.init.xavier_uniform_(self.conv.weight)
 
     def forward(self, x):
         x = self.conv(x)
@@ -32,34 +34,41 @@ class Net(nn.Module):
         self.__dict__.update(args.__dict__)     # Instill all args into self
         assert self.n_conv_layers % self.n_pool_layers == 0
         self.input_n_freq_bins = n_freq_bins = 64
-        self.output_size = 527
+        # Allow custom label dimensions while keeping the original TALNet architecture intact
+        self.output_size = getattr(args, 'output_size', 527)
         self.conv = []
-        pool_interval = self.n_conv_layers / self.n_pool_layers
+        pool_interval = self.n_conv_layers // self.n_pool_layers
         n_input = 1
         for i in range(self.n_conv_layers):
             if (i + 1) % pool_interval == 0:        # this layer has pooling
-                n_freq_bins /= 2
-                n_output = self.embedding_size / n_freq_bins
+                n_freq_bins //= 2
+                n_output = int(self.embedding_size // n_freq_bins)
                 pool_stride = (2, 2) if i < pool_interval * 2 else (1, 2)
             else:
-                n_output = self.embedding_size * 2 / n_freq_bins
+                n_output = int(self.embedding_size * 2 // n_freq_bins)
                 pool_stride = None
             layer = ConvBlock(n_input, n_output, self.kernel_size, batch_norm = self.batch_norm, pool_stride = pool_stride)
             self.conv.append(layer)
             self.__setattr__('conv' + str(i + 1), layer)
             n_input = n_output
-        self.gru = nn.GRU(self.embedding_size, self.embedding_size / 2, 1, batch_first = True, bidirectional = True)
-        self.fc_prob = nn.Linear(self.embedding_size, self.output_size)
+        self.gru = nn.GRU(self.embedding_size, int(self.embedding_size // 2), 1, batch_first = True, bidirectional = True)
+        self.fc_prob = nn.Linear(int(self.embedding_size), self.output_size)
         if self.pooling == 'att':
-            self.fc_att = nn.Linear(self.embedding_size, self.output_size)
+            self.fc_att = nn.Linear(int(self.embedding_size), self.output_size)
+        if self.pooling == 'autopool':
+            self.autopool = AutoPool1D(axis = 1, init = "zeros")
+        if self.pooling == 'powerpool':
+            self.powerpool = PowerPool1D(axis = 1)
+        if self.pooling == 'betaexp':
+            self.betaexp = BetaExpPool1D(axis = 1)
         # Better initialization
-        nn.init.orthogonal(self.gru.weight_ih_l0); nn.init.constant(self.gru.bias_ih_l0, 0)
-        nn.init.orthogonal(self.gru.weight_hh_l0); nn.init.constant(self.gru.bias_hh_l0, 0)
-        nn.init.orthogonal(self.gru.weight_ih_l0_reverse); nn.init.constant(self.gru.bias_ih_l0_reverse, 0)
-        nn.init.orthogonal(self.gru.weight_hh_l0_reverse); nn.init.constant(self.gru.bias_hh_l0_reverse, 0)
-        nn.init.xavier_uniform(self.fc_prob.weight); nn.init.constant(self.fc_prob.bias, 0)
+        nn.init.orthogonal_(self.gru.weight_ih_l0); nn.init.constant_(self.gru.bias_ih_l0, 0)
+        nn.init.orthogonal_(self.gru.weight_hh_l0); nn.init.constant_(self.gru.bias_hh_l0, 0)
+        nn.init.orthogonal_(self.gru.weight_ih_l0_reverse); nn.init.constant_(self.gru.bias_ih_l0_reverse, 0)
+        nn.init.orthogonal_(self.gru.weight_hh_l0_reverse); nn.init.constant_(self.gru.bias_hh_l0_reverse, 0)
+        nn.init.xavier_uniform_(self.fc_prob.weight); nn.init.constant_(self.fc_prob.bias, 0)
         if self.pooling == 'att':
-            nn.init.xavier_uniform(self.fc_att.weight); nn.init.constant(self.fc_att.bias, 0)
+            nn.init.xavier_uniform_(self.fc_att.weight); nn.init.constant_(self.fc_att.bias, 0)
 
     def forward(self, x):
         x = x.view((-1, 1, x.size(1), x.size(2)))                                                           # x becomes (batch, channel, time, freq)
@@ -79,11 +88,24 @@ class Net(nn.Module):
         elif self.pooling == 'ave':
             global_prob = frame_prob.mean(dim = 1)
             return global_prob, frame_prob
+        elif self.pooling == 'softmax':
+            frame_att = F.softmax(frame_prob, dim = 1)
+            global_prob = (frame_prob * frame_att).sum(dim = 1)
+            return global_prob, frame_prob
         elif self.pooling == 'lin':
             global_prob = (frame_prob * frame_prob).sum(dim = 1) / frame_prob.sum(dim = 1)
             return global_prob, frame_prob
         elif self.pooling == 'exp':
             global_prob = (frame_prob * frame_prob.exp()).sum(dim = 1) / frame_prob.exp().sum(dim = 1)
+            return global_prob, frame_prob
+        elif self.pooling == 'autopool':
+            global_prob = self.autopool(frame_prob)
+            return global_prob, frame_prob
+        elif self.pooling == 'powerpool':
+            global_prob = self.powerpool(frame_prob)
+            return global_prob, frame_prob
+        elif self.pooling == 'betaexp':
+            global_prob = self.betaexp(frame_prob)
             return global_prob, frame_prob
         elif self.pooling == 'att':
             frame_att = F.softmax(self.fc_att(x), dim = 1)
