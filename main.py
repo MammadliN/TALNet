@@ -48,11 +48,13 @@ RESERVED_COLUMNS = {
 class RunConfig:
     root: Path
     fnjv_root: Path
+    fnjv_metadata: Path
     pooling: str
     bag_seconds: int
     target_species: Sequence[str]
     dataset_name: str
     threshold_method: str
+    output_dir: Path
 
 
 def _discover_label_columns(metadata: pd.DataFrame) -> List[str]:
@@ -246,6 +248,63 @@ class AnuraSetDataset(Dataset):
         x = torch.tensor(features, dtype=torch.float32)
         labels = torch.tensor(item["labels"], dtype=torch.float32)
         return x, labels
+
+
+class FNJVDataset(Dataset):
+    def __init__(
+        self,
+        root: Path,
+        metadata: pd.DataFrame,
+        label_columns: Sequence[str],
+        sample_rate: int = 22000,
+        fps: float = 40.0,
+        n_mels: int = 64,
+        n_fft: int = 1100,
+    ) -> None:
+        super().__init__()
+        self.root = root
+        self.sample_rate = sample_rate
+        self.hop_length = int(round(sample_rate / fps))
+        self.n_mels = n_mels
+        self.n_fft = n_fft
+        self.label_columns = list(label_columns)
+        self.metadata = metadata.reset_index(drop=True)
+
+    def __len__(self) -> int:
+        return len(self.metadata)
+
+    def __getitem__(self, index: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        row = self.metadata.iloc[index]
+        audio_path = self.root / row["Arquivo do registro"]
+        y = _load_audio_segment(audio_path, self.sample_rate, start=0.0, duration=60.0)
+
+        expected_len = int(self.sample_rate * 60.0)
+        if len(y) < expected_len:
+            y = np.pad(y, (0, expected_len - len(y)), mode="constant")
+
+        mel = librosa.feature.melspectrogram(
+            y=y,
+            sr=self.sample_rate,
+            n_mels=self.n_mels,
+            n_fft=self.n_fft,
+            hop_length=self.hop_length,
+            power=2.0,
+        )
+        mel_db = librosa.power_to_db(mel, ref=np.max)
+        mel_db = (mel_db - mel_db.mean()) / (mel_db.std() + 1e-6)
+
+        features = mel_db.T
+        target_frames = int(math.ceil(60.0 * (self.sample_rate / self.hop_length)))
+        features = librosa.util.fix_length(features, size=target_frames, axis=0)
+
+        labels = np.zeros(len(self.label_columns), dtype=np.float32)
+        code = row["Code"]
+        if code in self.label_columns:
+            labels[self.label_columns.index(code)] = 1.0
+
+        x = torch.tensor(features, dtype=torch.float32)
+        y = torch.tensor(labels, dtype=torch.float32)
+        return x, y
 
 
 # ---------------------------------------------------------------------------
@@ -477,6 +536,7 @@ def build_stratified_split(
 def create_dataloaders(
     root: Path,
     fnjv_root: Path,
+    fnjv_metadata: Path,
     bag_seconds: int,
     batch_size: int,
     target_species: Sequence[str],
@@ -493,13 +553,15 @@ def create_dataloaders(
     anuraset_meta = pd.read_csv(root / "metadata.csv")
     label_columns = _select_label_columns(anuraset_meta, target_species)
     if dataset_name == "FNJV":
-        fnjv_meta = pd.read_csv(fnjv_root / "metadata.csv")
-        if any(col not in fnjv_meta.columns for col in label_columns):
-            missing = [col for col in label_columns if col not in fnjv_meta.columns]
-            raise ValueError(f"FNJV metadata missing label columns: {missing}")
-        train_ds = AnuraSetDataset(
-            fnjv_root, bag_seconds, fnjv_meta, label_columns, subset=None
-        )
+        fnjv_meta = pd.read_csv(fnjv_metadata)
+        fnjv_meta = fnjv_meta[fnjv_meta["Code"].notna()]
+        fnjv_meta = fnjv_meta[fnjv_meta["Code"].str.upper() != "IGNORE"]
+        fnjv_codes = sorted({code for code in fnjv_meta["Code"] if code in label_columns})
+        if not fnjv_codes:
+            raise ValueError("FNJV metadata has no matching species codes with AnuraSet.")
+        label_columns = fnjv_codes
+        fnjv_meta = fnjv_meta[fnjv_meta["Code"].isin(label_columns)]
+        train_ds = FNJVDataset(fnjv_root, fnjv_meta, label_columns)
         val_ds = AnuraSetDataset(
             root, bag_seconds, anuraset_meta, label_columns, subset="train"
         )
@@ -578,6 +640,7 @@ def main(args: argparse.Namespace, run_config: RunConfig) -> None:
     train_ds, val_ds, train_loader_info, val_loader_info, test_loader_info = create_dataloaders(
         run_config.root,
         run_config.fnjv_root,
+        run_config.fnjv_metadata,
         run_config.bag_seconds,
         batch_size=args.batch_size,
         target_species=run_config.target_species,
@@ -592,6 +655,11 @@ def main(args: argparse.Namespace, run_config: RunConfig) -> None:
     optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
 
     best_f1 = -1.0
+    best_macro = -1.0
+    run_config.output_dir.mkdir(parents=True, exist_ok=True)
+    best_micro_path = run_config.output_dir / "best_model_micro.pt"
+    best_macro_path = run_config.output_dir / "best_model_macro.pt"
+    plot_path = run_config.output_dir / "training_metrics.png"
     history: Dict[str, Dict[str, List[float]]] = {
         "train": {
             "loss": [],
@@ -702,123 +770,136 @@ def main(args: argparse.Namespace, run_config: RunConfig) -> None:
         )
         if val_metrics["micro_f1"] > best_f1:
             best_f1 = val_metrics["micro_f1"]
-            torch.save(model.state_dict(), "best_talnet.pt")
-        _plot_history(Path("training_metrics.png"))
+            torch.save(model.state_dict(), best_micro_path)
+        if val_metrics["macro_f1"] > best_macro:
+            best_macro = val_metrics["macro_f1"]
+            torch.save(model.state_dict(), best_macro_path)
+        _plot_history(plot_path)
 
     print("Training finished. Best micro-F1: {:.4f}".format(best_f1))
+    print("Training finished. Best macro-F1: {:.4f}".format(best_macro))
 
     if test_loader_info is None:
         print("No test split available; skipping localization evaluation.")
         return
 
-    model.load_state_dict(torch.load("best_talnet.pt", map_location=device))
-    model.eval()
-
     val_loader, _, val_is_gen = val_loader_info
     val_data = val_loader() if val_is_gen else val_loader
-    val_global, val_frame, val_targets = collect_outputs(model, val_data, device)
-
     test_loader, _, test_is_gen = test_loader_info
     test_data = test_loader() if test_is_gen else test_loader
-    test_global, test_frame, test_targets = collect_outputs(model, test_data, device)
 
-    val_frame_targets = val_targets.unsqueeze(1).repeat(1, val_frame.size(1), 1)
-    test_frame_targets = test_targets.unsqueeze(1).repeat(1, test_frame.size(1), 1)
+    def evaluate_model(tag: str, model_path: Path) -> None:
+        if not model_path.exists():
+            print(f"[{tag}] model file not found: {model_path}")
+            return
+        model.load_state_dict(torch.load(model_path, map_location=device))
+        model.eval()
 
-    global_threshold = find_best_global_threshold(val_global, val_targets)
-    per_class_tagging_thresholds = find_best_per_class_thresholds(val_global, val_targets)
-    per_class_segment_thresholds = find_best_per_class_thresholds(
-        val_frame.reshape(-1, val_frame.size(-1)),
-        val_frame_targets.reshape(-1, val_frame_targets.size(-1)),
-    )
+        val_global, val_frame, val_targets = collect_outputs(model, val_data, device)
+        test_global, test_frame, test_targets = collect_outputs(model, test_data, device)
 
-    methods = ["global", "per_class", "segment"]
-    if run_config.threshold_method != "all":
-        methods = [run_config.threshold_method]
+        val_frame_targets = val_targets.unsqueeze(1).repeat(1, val_frame.size(1), 1)
+        test_frame_targets = test_targets.unsqueeze(1).repeat(1, test_frame.size(1), 1)
 
-    for method in methods:
-        if method == "global":
-            tag_metrics = compute_classification_metrics(
-                test_global, test_targets, thresholds=global_threshold
-            )
-            frame_metrics = compute_classification_metrics(
-                test_frame.reshape(-1, test_frame.size(-1)),
-                test_frame_targets.reshape(-1, test_frame_targets.size(-1)),
-                thresholds=global_threshold,
-            )
-            print(
-                "[global threshold] tagging micro-P={mp:.4f} micro-R={mr:.4f} micro-F1={mf1:.4f} "
-                "macro-P={Mp:.4f} macro-R={Mr:.4f} macro-F1={Mf1:.4f} ER={er:.4f}".format(
-                    mp=tag_metrics["micro_precision"],
-                    mr=tag_metrics["micro_recall"],
-                    mf1=tag_metrics["micro_f1"],
-                    Mp=tag_metrics["macro_precision"],
-                    Mr=tag_metrics["macro_recall"],
-                    Mf1=tag_metrics["macro_f1"],
-                    er=tag_metrics["er"],
+        global_threshold = find_best_global_threshold(val_global, val_targets)
+        per_class_tagging_thresholds = find_best_per_class_thresholds(val_global, val_targets)
+        per_class_segment_thresholds = find_best_per_class_thresholds(
+            val_frame.reshape(-1, val_frame.size(-1)),
+            val_frame_targets.reshape(-1, val_frame_targets.size(-1)),
+        )
+
+        methods = ["global", "per_class", "segment"]
+        if run_config.threshold_method != "all":
+            methods = [run_config.threshold_method]
+
+        print(f"[{tag}] Evaluation results:")
+        for method in methods:
+            if method == "global":
+                tag_metrics = compute_classification_metrics(
+                    test_global, test_targets, thresholds=global_threshold
                 )
-            )
-            print(
-                "[global threshold] localization micro-P={mp:.4f} micro-R={mr:.4f} micro-F1={mf1:.4f} "
-                "macro-P={Mp:.4f} macro-R={Mr:.4f} macro-F1={Mf1:.4f} ER={er:.4f}".format(
-                    mp=frame_metrics["micro_precision"],
-                    mr=frame_metrics["micro_recall"],
-                    mf1=frame_metrics["micro_f1"],
-                    Mp=frame_metrics["macro_precision"],
-                    Mr=frame_metrics["macro_recall"],
-                    Mf1=frame_metrics["macro_f1"],
-                    er=frame_metrics["er"],
-                )
-            )
-        else:
-            tag_metrics = compute_classification_metrics(
-                test_global, test_targets, thresholds=per_class_tagging_thresholds
-            )
-            if method == "per_class":
                 frame_metrics = compute_classification_metrics(
                     test_frame.reshape(-1, test_frame.size(-1)),
                     test_frame_targets.reshape(-1, test_frame_targets.size(-1)),
-                    thresholds=per_class_tagging_thresholds,
+                    thresholds=global_threshold,
                 )
-                label = "per-class threshold"
+                print(
+                    "[global threshold] tagging micro-P={mp:.4f} micro-R={mr:.4f} micro-F1={mf1:.4f} "
+                    "macro-P={Mp:.4f} macro-R={Mr:.4f} macro-F1={Mf1:.4f} ER={er:.4f}".format(
+                        mp=tag_metrics["micro_precision"],
+                        mr=tag_metrics["micro_recall"],
+                        mf1=tag_metrics["micro_f1"],
+                        Mp=tag_metrics["macro_precision"],
+                        Mr=tag_metrics["macro_recall"],
+                        Mf1=tag_metrics["macro_f1"],
+                        er=tag_metrics["er"],
+                    )
+                )
+                print(
+                    "[global threshold] localization micro-P={mp:.4f} micro-R={mr:.4f} micro-F1={mf1:.4f} "
+                    "macro-P={Mp:.4f} macro-R={Mr:.4f} macro-F1={Mf1:.4f} ER={er:.4f}".format(
+                        mp=frame_metrics["micro_precision"],
+                        mr=frame_metrics["micro_recall"],
+                        mf1=frame_metrics["micro_f1"],
+                        Mp=frame_metrics["macro_precision"],
+                        Mr=frame_metrics["macro_recall"],
+                        Mf1=frame_metrics["macro_f1"],
+                        er=frame_metrics["er"],
+                    )
+                )
             else:
-                frame_metrics = compute_classification_metrics(
-                    test_frame.reshape(-1, test_frame.size(-1)),
-                    test_frame_targets.reshape(-1, test_frame_targets.size(-1)),
-                    thresholds=per_class_segment_thresholds,
+                tag_metrics = compute_classification_metrics(
+                    test_global, test_targets, thresholds=per_class_tagging_thresholds
                 )
-                label = "segment-level threshold"
-            print(
-                "[{label}] tagging micro-P={mp:.4f} micro-R={mr:.4f} micro-F1={mf1:.4f} "
-                "macro-P={Mp:.4f} macro-R={Mr:.4f} macro-F1={Mf1:.4f} ER={er:.4f}".format(
-                    label=label,
-                    mp=tag_metrics["micro_precision"],
-                    mr=tag_metrics["micro_recall"],
-                    mf1=tag_metrics["micro_f1"],
-                    Mp=tag_metrics["macro_precision"],
-                    Mr=tag_metrics["macro_recall"],
-                    Mf1=tag_metrics["macro_f1"],
-                    er=tag_metrics["er"],
+                if method == "per_class":
+                    frame_metrics = compute_classification_metrics(
+                        test_frame.reshape(-1, test_frame.size(-1)),
+                        test_frame_targets.reshape(-1, test_frame_targets.size(-1)),
+                        thresholds=per_class_tagging_thresholds,
+                    )
+                    label = "per-class threshold"
+                else:
+                    frame_metrics = compute_classification_metrics(
+                        test_frame.reshape(-1, test_frame.size(-1)),
+                        test_frame_targets.reshape(-1, test_frame_targets.size(-1)),
+                        thresholds=per_class_segment_thresholds,
+                    )
+                    label = "segment-level threshold"
+                print(
+                    "[{label}] tagging micro-P={mp:.4f} micro-R={mr:.4f} micro-F1={mf1:.4f} "
+                    "macro-P={Mp:.4f} macro-R={Mr:.4f} macro-F1={Mf1:.4f} ER={er:.4f}".format(
+                        label=label,
+                        mp=tag_metrics["micro_precision"],
+                        mr=tag_metrics["micro_recall"],
+                        mf1=tag_metrics["micro_f1"],
+                        Mp=tag_metrics["macro_precision"],
+                        Mr=tag_metrics["macro_recall"],
+                        Mf1=tag_metrics["macro_f1"],
+                        er=tag_metrics["er"],
+                    )
                 )
-            )
-            print(
-                "[{label}] localization micro-P={mp:.4f} micro-R={mr:.4f} micro-F1={mf1:.4f} "
-                "macro-P={Mp:.4f} macro-R={Mr:.4f} macro-F1={Mf1:.4f} ER={er:.4f}".format(
-                    label=label,
-                    mp=frame_metrics["micro_precision"],
-                    mr=frame_metrics["micro_recall"],
-                    mf1=frame_metrics["micro_f1"],
-                    Mp=frame_metrics["macro_precision"],
-                    Mr=frame_metrics["macro_recall"],
-                    Mf1=frame_metrics["macro_f1"],
-                    er=frame_metrics["er"],
+                print(
+                    "[{label}] localization micro-P={mp:.4f} micro-R={mr:.4f} micro-F1={mf1:.4f} "
+                    "macro-P={Mp:.4f} macro-R={Mr:.4f} macro-F1={Mf1:.4f} ER={er:.4f}".format(
+                        label=label,
+                        mp=frame_metrics["micro_precision"],
+                        mr=frame_metrics["micro_recall"],
+                        mf1=frame_metrics["micro_f1"],
+                        Mp=frame_metrics["macro_precision"],
+                        Mr=frame_metrics["macro_recall"],
+                        Mf1=frame_metrics["macro_f1"],
+                        er=frame_metrics["er"],
+                    )
                 )
-            )
+
+    evaluate_model("best-micro", best_micro_path)
+    evaluate_model("best-macro", best_macro_path)
 
 
 if __name__ == "__main__":
     ANURASET_ROOT = Path(r"/ds-iml/Bioacoustics/AnuraSet/raw_data")
-    FNJV_ROOT = Path(r"/ds-iml/Bioacoustics/FNJV/raw_data")
+    FNJV_ROOT = Path(r"/ds-iml/Bioacoustics/FNJV/458")
+    FNJV_METADATA = FNJV_ROOT / "metadata_filtered_filled.csv"
     DEFAULT_POOLING = "max"
     DEFAULT_BAG_SECONDS = 10
     DATASET_NAME = "AnuraSet"
@@ -872,6 +953,12 @@ if __name__ == "__main__":
         help="Override FNJV root containing metadata.csv and site folders",
     )
     parser.add_argument(
+        "--fnjv_metadata",
+        type=Path,
+        default=None,
+        help="Override FNJV metadata CSV (metadata_filtered_filled.csv)",
+    )
+    parser.add_argument(
         "--dataset_name",
         type=str,
         default=DATASET_NAME,
@@ -903,18 +990,26 @@ if __name__ == "__main__":
     cli_args = parser.parse_args()
     resolved_root = cli_args.root or ANURASET_ROOT
     resolved_fnjv_root = cli_args.fnjv_root or FNJV_ROOT
+    resolved_fnjv_metadata = cli_args.fnjv_metadata or FNJV_METADATA
     resolved_pooling = cli_args.pooling or DEFAULT_POOLING
     resolved_bag_seconds = cli_args.bag_seconds or DEFAULT_BAG_SECONDS
     resolved_species = [] if cli_args.all_species else cli_args.target_species
 
+    output_dir = Path("outputs") / (
+        f"{cli_args.dataset_name}_{resolved_pooling}_{resolved_bag_seconds}sec_"
+        f"{cli_args.epochs}epoch_{cli_args.batch_size}batch"
+    )
+
     run_config = RunConfig(
         root=resolved_root,
         fnjv_root=resolved_fnjv_root,
+        fnjv_metadata=resolved_fnjv_metadata,
         pooling=resolved_pooling,
         bag_seconds=resolved_bag_seconds,
         target_species=resolved_species,
         dataset_name=cli_args.dataset_name,
         threshold_method=cli_args.threshold_method,
+        output_dir=output_dir,
     )
 
     main(cli_args, run_config)
