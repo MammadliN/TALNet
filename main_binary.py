@@ -40,6 +40,11 @@ class RunConfig:
     pooling: str
     bag_seconds: int
     output_dir: Path
+    sample_rate: int
+    fps: float
+    n_mels: int
+    n_fft: int
+    embedding_size: int
 
 
 def _load_audio_segment(path: Path, sample_rate: int, start: float, duration: float) -> np.ndarray:
@@ -98,10 +103,10 @@ class AnuraSetBinaryDataset(Dataset):
         metadata: pd.DataFrame,
         label_columns: Sequence[str],
         subset: Optional[str],
-        sample_rate: int = 22000,
-        fps: float = 40.0,
-        n_mels: int = 64,
-        n_fft: int = 1100,
+        sample_rate: int,
+        fps: float,
+        n_mels: int,
+        n_fft: int,
         clip_duration: int = 60,
     ) -> None:
         super().__init__()
@@ -183,10 +188,10 @@ class FNJVBIN(Dataset):
         root: Path,
         metadata: pd.DataFrame,
         label_columns: Sequence[str],
-        sample_rate: int = 22000,
-        fps: float = 40.0,
-        n_mels: int = 64,
-        n_fft: int = 1100,
+        sample_rate: int,
+        fps: float,
+        n_mels: int,
+        n_fft: int,
     ) -> None:
         super().__init__()
         self.root = root
@@ -237,8 +242,8 @@ class TalnetArgs:
     output_size: int = 2
 
 
-def build_model(pooling: str, output_size: int, device: torch.device) -> Net:
-    args = TalnetArgs(pooling=pooling, output_size=output_size)
+def build_model(pooling: str, output_size: int, device: torch.device, embedding_size: int) -> Net:
+    args = TalnetArgs(pooling=pooling, output_size=output_size, embedding_size=embedding_size)
     return Net(args).to(device)
 
 
@@ -386,21 +391,50 @@ def main(args: argparse.Namespace, run_config: RunConfig) -> None:
         raise ValueError("No FNJV species codes found in AnuraSet metadata.")
 
     fnjv_meta = fnjv_meta[fnjv_meta["Code"].isin(fnjv_codes)]
-    train_ds = FNJVBIN(run_config.fnjv_root, fnjv_meta, fnjv_codes)
+    train_ds = FNJVBIN(
+        run_config.fnjv_root,
+        fnjv_meta,
+        fnjv_codes,
+        sample_rate=run_config.sample_rate,
+        fps=run_config.fps,
+        n_mels=run_config.n_mels,
+        n_fft=run_config.n_fft,
+    )
 
     anuraset_meta = anuraset_meta[anuraset_meta[fnjv_codes].sum(axis=1) > 0]
     val_ds = AnuraSetBinaryDataset(
-        run_config.anuraset_root, run_config.bag_seconds, anuraset_meta, fnjv_codes, subset="train"
+        run_config.anuraset_root,
+        run_config.bag_seconds,
+        anuraset_meta,
+        fnjv_codes,
+        subset="train",
+        sample_rate=run_config.sample_rate,
+        fps=run_config.fps,
+        n_mels=run_config.n_mels,
+        n_fft=run_config.n_fft,
     )
     test_ds = AnuraSetBinaryDataset(
-        run_config.anuraset_root, run_config.bag_seconds, anuraset_meta, fnjv_codes, subset="test"
+        run_config.anuraset_root,
+        run_config.bag_seconds,
+        anuraset_meta,
+        fnjv_codes,
+        subset="test",
+        sample_rate=run_config.sample_rate,
+        fps=run_config.fps,
+        n_mels=run_config.n_mels,
+        n_fft=run_config.n_fft,
     )
 
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False)
     test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False)
 
-    model = build_model(run_config.pooling, output_size=2, device=device)
+    model = build_model(
+        run_config.pooling,
+        output_size=2,
+        device=device,
+        embedding_size=run_config.embedding_size,
+    )
     criterion = nn.BCELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
 
@@ -460,12 +494,28 @@ def main(args: argparse.Namespace, run_config: RunConfig) -> None:
 
 
 if __name__ == "__main__":
+    SAMPLE_RATE = 22000
+    FPS = 40.0
+    N_MELS = 64
+    N_FFT = 1100
+    EMBEDDING_SIZE = 1024
+
     parser = argparse.ArgumentParser(description="Binary frog/background training")
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--learning_rate", type=float, default=1e-3)
-    parser.add_argument("--pooling", type=str, default="max")
+    parser.add_argument(
+        "--pooling",
+        type=str,
+        default="max",
+        choices=["max", "ave", "lin", "exp", "att", "softmax", "autopool", "powerpool", "betaexp"],
+    )
     parser.add_argument("--bag_seconds", type=int, default=10)
+    parser.add_argument("--sample_rate", type=int, default=SAMPLE_RATE)
+    parser.add_argument("--fps", type=float, default=FPS)
+    parser.add_argument("--n_mels", type=int, default=N_MELS)
+    parser.add_argument("--n_fft", type=int, default=N_FFT)
+    parser.add_argument("--embedding_size", type=int, default=EMBEDDING_SIZE)
     parser.add_argument(
         "--anuraset_root",
         type=Path,
@@ -494,5 +544,10 @@ if __name__ == "__main__":
         pooling=args.pooling,
         bag_seconds=args.bag_seconds,
         output_dir=output_dir,
+        sample_rate=args.sample_rate,
+        fps=args.fps,
+        n_mels=args.n_mels,
+        n_fft=args.n_fft,
+        embedding_size=args.embedding_size,
     )
     main(args, run_config)

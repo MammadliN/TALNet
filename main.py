@@ -55,6 +55,11 @@ class RunConfig:
     dataset_name: str
     threshold_method: str
     output_dir: Path
+    sample_rate: int
+    fps: float
+    n_mels: int
+    n_fft: int
+    embedding_size: int
 
 
 def _discover_label_columns(metadata: pd.DataFrame) -> List[str]:
@@ -155,10 +160,10 @@ class AnuraSetDataset(Dataset):
         label_columns: Sequence[str],
         subset: Optional[str] = None,
         file_filter: Optional[Set[Tuple[str, str]]] = None,
-        sample_rate: int = 22000,
-        fps: float = 40.0,
-        n_mels: int = 64,
-        n_fft: int = 1100,
+        sample_rate: int,
+        fps: float,
+        n_mels: int,
+        n_fft: int,
         clip_duration: int = 60,
     ) -> None:
         super().__init__()
@@ -256,10 +261,10 @@ class FNJVDataset(Dataset):
         root: Path,
         metadata: pd.DataFrame,
         label_columns: Sequence[str],
-        sample_rate: int = 22000,
-        fps: float = 40.0,
-        n_mels: int = 64,
-        n_fft: int = 1100,
+        sample_rate: int,
+        fps: float,
+        n_mels: int,
+        n_fft: int,
     ) -> None:
         super().__init__()
         self.root = root
@@ -324,8 +329,8 @@ class TalnetArgs:
     output_size: int = 527
 
 
-def build_model(pooling: str, output_size: int, device: torch.device) -> Net:
-    args = TalnetArgs(pooling=pooling, output_size=output_size)
+def build_model(pooling: str, output_size: int, device: torch.device, embedding_size: int) -> Net:
+    args = TalnetArgs(pooling=pooling, output_size=output_size, embedding_size=embedding_size)
     model = Net(args).to(device)
     return model
 
@@ -541,6 +546,10 @@ def create_dataloaders(
     batch_size: int,
     target_species: Sequence[str],
     dataset_name: str,
+    sample_rate: int,
+    fps: float,
+    n_mels: int,
+    n_fft: int,
     num_workers: int = 0,
     use_batch_generator: bool = False,
 ) -> Tuple[
@@ -561,13 +570,39 @@ def create_dataloaders(
             raise ValueError("FNJV metadata has no matching species codes with AnuraSet.")
         label_columns = fnjv_codes
         fnjv_meta = fnjv_meta[fnjv_meta["Code"].isin(label_columns)]
-        train_ds = FNJVDataset(fnjv_root, fnjv_meta, label_columns)
+        train_ds = FNJVDataset(
+            fnjv_root,
+            fnjv_meta,
+            label_columns,
+            sample_rate=sample_rate,
+            fps=fps,
+            n_mels=n_mels,
+            n_fft=n_fft,
+        )
         val_ds = AnuraSetDataset(
-            root, bag_seconds, anuraset_meta, label_columns, subset="train"
+            root,
+            bag_seconds,
+            anuraset_meta,
+            label_columns,
+            subset="train",
+            sample_rate=sample_rate,
+            fps=fps,
+            n_mels=n_mels,
+            n_fft=n_fft,
         )
         test_subset = "test" if "test" in anuraset_meta["subset"].unique() else None
         test_ds = (
-            AnuraSetDataset(root, bag_seconds, anuraset_meta, label_columns, subset=test_subset)
+            AnuraSetDataset(
+                root,
+                bag_seconds,
+                anuraset_meta,
+                label_columns,
+                subset=test_subset,
+                sample_rate=sample_rate,
+                fps=fps,
+                n_mels=n_mels,
+                n_fft=n_fft,
+            )
             if test_subset
             else None
         )
@@ -580,6 +615,10 @@ def create_dataloaders(
             label_columns,
             subset="train",
             file_filter=train_files,
+            sample_rate=sample_rate,
+            fps=fps,
+            n_mels=n_mels,
+            n_fft=n_fft,
         )
         val_ds = AnuraSetDataset(
             root,
@@ -588,10 +627,24 @@ def create_dataloaders(
             label_columns,
             subset="train",
             file_filter=val_files,
+            sample_rate=sample_rate,
+            fps=fps,
+            n_mels=n_mels,
+            n_fft=n_fft,
         )
         test_subset = "test" if "test" in anuraset_meta["subset"].unique() else None
         test_ds = (
-            AnuraSetDataset(root, bag_seconds, anuraset_meta, label_columns, subset=test_subset)
+            AnuraSetDataset(
+                root,
+                bag_seconds,
+                anuraset_meta,
+                label_columns,
+                subset=test_subset,
+                sample_rate=sample_rate,
+                fps=fps,
+                n_mels=n_mels,
+                n_fft=n_fft,
+            )
             if test_subset
             else None
         )
@@ -645,12 +698,16 @@ def main(args: argparse.Namespace, run_config: RunConfig) -> None:
         batch_size=args.batch_size,
         target_species=run_config.target_species,
         dataset_name=run_config.dataset_name,
+        sample_rate=run_config.sample_rate,
+        fps=run_config.fps,
+        n_mels=run_config.n_mels,
+        n_fft=run_config.n_fft,
         num_workers=args.num_workers,
         use_batch_generator=args.use_batch_generator,
     )
 
     output_size = len(train_ds.label_columns)
-    model = build_model(run_config.pooling, output_size, device)
+    model = build_model(run_config.pooling, output_size, device, run_config.embedding_size)
     criterion = nn.BCELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
 
@@ -904,6 +961,11 @@ if __name__ == "__main__":
     DEFAULT_BAG_SECONDS = 10
     DATASET_NAME = "AnuraSet"
     THRESHOLD_METHOD = "all"
+    SAMPLE_RATE = 22000
+    FPS = 40.0
+    N_MELS = 64
+    N_FFT = 1100
+    EMBEDDING_SIZE = 1024
 
     TARGET_SPECIES = [
         "DENMIN",
@@ -986,6 +1048,11 @@ if __name__ == "__main__":
         choices=[3, 10, 15, 30, 60],
         help="Non-overlapping bag duration in seconds",
     )
+    parser.add_argument("--sample_rate", type=int, default=SAMPLE_RATE)
+    parser.add_argument("--fps", type=float, default=FPS)
+    parser.add_argument("--n_mels", type=int, default=N_MELS)
+    parser.add_argument("--n_fft", type=int, default=N_FFT)
+    parser.add_argument("--embedding_size", type=int, default=EMBEDDING_SIZE)
 
     cli_args = parser.parse_args()
     resolved_root = cli_args.root or ANURASET_ROOT
@@ -1010,6 +1077,11 @@ if __name__ == "__main__":
         dataset_name=cli_args.dataset_name,
         threshold_method=cli_args.threshold_method,
         output_dir=output_dir,
+        sample_rate=cli_args.sample_rate,
+        fps=cli_args.fps,
+        n_mels=cli_args.n_mels,
+        n_fft=cli_args.n_fft,
+        embedding_size=cli_args.embedding_size,
     )
 
     main(cli_args, run_config)
