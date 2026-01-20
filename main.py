@@ -10,38 +10,21 @@ from __future__ import annotations
 
 import argparse
 import math
-import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
-import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, Dataset
-
-import librosa
-import matplotlib.pyplot as plt
-import soundfile as sf
+from torch.utils.data import DataLoader
+import numpy as np
 
 from Net import Net
-
-
-# ---------------------------------------------------------------------------
-# Data handling
-# ---------------------------------------------------------------------------
-
-RESERVED_COLUMNS = {
-    "sample_name",
-    "fname",
-    "min_t",
-    "max_t",
-    "site",
-    "date",
-    "species_number",
-    "subset",
-}
+from dataset import AnuraSetDataset, FNJVDataset, select_label_columns
+from metrics import compute_classification_metrics
+from thresholds import find_best_global_threshold, find_best_per_class_thresholds
+from visualization import plot_history
 
 
 @dataclass
@@ -60,256 +43,6 @@ class RunConfig:
     n_mels: int
     n_fft: int
     embedding_size: int
-
-
-def _discover_label_columns(metadata: pd.DataFrame) -> List[str]:
-    """Return label column names in original order."""
-
-    return [c for c in metadata.columns if c not in RESERVED_COLUMNS]
-
-
-def _select_label_columns(
-    metadata: pd.DataFrame, target_species: Sequence[str]
-) -> List[str]:
-    label_columns = _discover_label_columns(metadata)
-    if not target_species:
-        return label_columns
-
-    filtered = [c for c in label_columns if c in target_species]
-    if not filtered:
-        raise ValueError(
-            "None of the requested target species were found in metadata columns."
-        )
-    missing = [c for c in target_species if c not in filtered]
-    if missing:
-        print(
-            "Warning: the following target species were not present in metadata and will"
-            f" be ignored: {missing}"
-        )
-    return filtered
-
-
-def _load_audio_segment(
-    path: Path, sample_rate: int, start: float, duration: float
-) -> np.ndarray:
-    """Load a mono audio segment, preferring soundfile to avoid audioread fallbacks."""
-
-    start_frame = int(round(start * sample_rate))
-    frame_count = int(round(duration * sample_rate))
-
-    try:
-        info = sf.info(path)
-        native_sr = info.samplerate
-        total_frames = info.frames
-
-        if start_frame >= total_frames:
-            return np.zeros(frame_count, dtype=np.float32)
-
-        frames_to_read = min(frame_count, total_frames - start_frame)
-        audio, sr = sf.read(
-            path,
-            start=start_frame,
-            frames=frames_to_read,
-            dtype="float32",
-            always_2d=False,
-        )
-        if audio.ndim > 1:
-            audio = audio.mean(axis=1)
-        if sr != sample_rate:
-            audio = librosa.resample(audio, orig_sr=sr, target_sr=sample_rate)
-        if len(audio) < frame_count:
-            audio = np.pad(audio, (0, frame_count - len(audio)), mode="constant")
-        return audio
-    except Exception as exc:  # pragma: no cover - fallback path
-        warnings.warn(
-            f"soundfile failed for {path} ({exc}); falling back to librosa.load",
-            RuntimeWarning,
-        )
-        audio, _ = librosa.load(
-            path, sr=sample_rate, offset=start, duration=duration, mono=True
-        )
-        if len(audio) < frame_count:
-            audio = np.pad(audio, (0, frame_count - len(audio)), mode="constant")
-        return audio
-
-
-def _ensure_audio_path(root: Path, row: pd.Series) -> Path:
-    """Locate the wav file for a metadata row."""
-
-    candidates = [
-        root / str(row["site"]) / f"{row['fname']}.wav",
-        root / str(row["site"]) / str(row["fname"]),
-        root / str(row["site"]) / str(row.get("sample_name", "")),
-    ]
-    for path in candidates:
-        if path.suffix == "":
-            path = path.with_suffix(".wav")
-        if path.exists():
-            return path
-    # Fall back to first guess even if it does not exist so the caller gets
-    # a clear error when attempting to load.
-    return candidates[0].with_suffix(".wav")
-
-
-class AnuraSetDataset(Dataset):
-    def __init__(
-        self,
-        root: Path,
-        bag_seconds: int,
-        metadata: pd.DataFrame,
-        label_columns: Sequence[str],
-        subset: Optional[str] = None,
-        file_filter: Optional[Set[Tuple[str, str]]] = None,
-        sample_rate: int = 22000,
-        fps: float = 40.0,
-        n_mels: int = 64,
-        n_fft: int = 1100,
-        clip_duration: int = 60,
-    ) -> None:
-        super().__init__()
-        self.root = root
-        self.bag_seconds = bag_seconds
-        self.sample_rate = sample_rate
-        self.hop_length = int(round(sample_rate / fps))
-        self.n_mels = n_mels
-        self.n_fft = n_fft
-        self.clip_duration = clip_duration
-        self.label_columns = list(label_columns)
-        self.subset = subset
-
-        if subset:
-            self.metadata = metadata[metadata["subset"] == subset].copy()
-        else:
-            self.metadata = metadata.copy()
-        if file_filter:
-            file_df = pd.DataFrame(list(file_filter), columns=["site", "fname"])
-            self.metadata = self.metadata.merge(file_df, on=["site", "fname"], how="inner")
-
-        self.items = self._build_index()
-
-    def _build_index(self) -> List[Dict]:
-        entries: List[Dict] = []
-        grouped = self.metadata.groupby(["site", "fname"], sort=False)
-        for (site, fname), group in grouped:
-            if group.empty:
-                continue
-            total_duration = max(group["max_t"].max(), float(self.clip_duration))
-            n_bags = int(total_duration // self.bag_seconds)
-            audio_path = _ensure_audio_path(self.root, group.iloc[0])
-
-            for idx in range(n_bags):
-                start_time = idx * self.bag_seconds
-                end_time = start_time + self.bag_seconds
-                in_window = (group["min_t"] >= start_time) & (group["max_t"] <= end_time)
-                label_block = group.loc[in_window, self.label_columns]
-                if label_block.empty:
-                    labels = np.zeros(len(self.label_columns), dtype=np.float32)
-                else:
-                    labels = label_block.values.astype(np.float32).max(axis=0)
-                entries.append(
-                    {
-                        "audio_path": audio_path,
-                        "start": float(start_time),
-                        "labels": labels,
-                        "subset": group["subset"].iloc[0],
-                        "site": site,
-                        "fname": fname,
-                    }
-                )
-        return entries
-
-    def __len__(self) -> int:
-        return len(self.items)
-
-    def __getitem__(self, index: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        item = self.items[index]
-        y = _load_audio_segment(
-            item["audio_path"],
-            sample_rate=self.sample_rate,
-            start=item["start"],
-            duration=self.bag_seconds,
-        )
-
-        expected_len = int(self.sample_rate * self.bag_seconds)
-        if len(y) < expected_len:
-            y = np.pad(y, (0, expected_len - len(y)), mode="constant")
-
-        mel = librosa.feature.melspectrogram(
-            y=y,
-            sr=self.sample_rate,
-            n_mels=self.n_mels,
-            n_fft=self.n_fft,
-            hop_length=self.hop_length,
-            power=2.0,
-        )
-        mel_db = librosa.power_to_db(mel, ref=np.max)
-        # Normalize per-clip
-        mel_db = (mel_db - mel_db.mean()) / (mel_db.std() + 1e-6)
-
-        features = mel_db.T  # time x mel
-        target_frames = int(math.ceil(self.bag_seconds * (self.sample_rate / self.hop_length)))
-        features = librosa.util.fix_length(features, size=target_frames, axis=0)
-
-        x = torch.tensor(features, dtype=torch.float32)
-        labels = torch.tensor(item["labels"], dtype=torch.float32)
-        return x, labels
-
-
-class FNJVDataset(Dataset):
-    def __init__(
-        self,
-        root: Path,
-        metadata: pd.DataFrame,
-        label_columns: Sequence[str],
-        sample_rate: int,
-        fps: float,
-        n_mels: int,
-        n_fft: int,
-    ) -> None:
-        super().__init__()
-        self.root = root
-        self.sample_rate = sample_rate
-        self.hop_length = int(round(sample_rate / fps))
-        self.n_mels = n_mels
-        self.n_fft = n_fft
-        self.label_columns = list(label_columns)
-        self.metadata = metadata.reset_index(drop=True)
-
-    def __len__(self) -> int:
-        return len(self.metadata)
-
-    def __getitem__(self, index: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        row = self.metadata.iloc[index]
-        audio_path = self.root / row["Arquivo do registro"]
-        y = _load_audio_segment(audio_path, self.sample_rate, start=0.0, duration=60.0)
-
-        expected_len = int(self.sample_rate * 60.0)
-        if len(y) < expected_len:
-            y = np.pad(y, (0, expected_len - len(y)), mode="constant")
-
-        mel = librosa.feature.melspectrogram(
-            y=y,
-            sr=self.sample_rate,
-            n_mels=self.n_mels,
-            n_fft=self.n_fft,
-            hop_length=self.hop_length,
-            power=2.0,
-        )
-        mel_db = librosa.power_to_db(mel, ref=np.max)
-        mel_db = (mel_db - mel_db.mean()) / (mel_db.std() + 1e-6)
-
-        features = mel_db.T
-        target_frames = int(math.ceil(60.0 * (self.sample_rate / self.hop_length)))
-        features = librosa.util.fix_length(features, size=target_frames, axis=0)
-
-        labels = np.zeros(len(self.label_columns), dtype=np.float32)
-        code = row["Code"]
-        if code in self.label_columns:
-            labels[self.label_columns.index(code)] = 1.0
-
-        x = torch.tensor(features, dtype=torch.float32)
-        y = torch.tensor(labels, dtype=torch.float32)
-        return x, y
 
 
 # ---------------------------------------------------------------------------
@@ -333,110 +66,6 @@ def build_model(pooling: str, output_size: int, device: torch.device, embedding_
     args = TalnetArgs(pooling=pooling, output_size=output_size, embedding_size=embedding_size)
     model = Net(args).to(device)
     return model
-
-
-def _binarize_predictions(
-    preds: np.ndarray, thresholds: np.ndarray | float
-) -> np.ndarray:
-    if isinstance(thresholds, np.ndarray):
-        return (preds >= thresholds).astype(np.int32)
-    return (preds >= thresholds).astype(np.int32)
-
-
-def compute_classification_metrics(
-    preds: torch.Tensor, targets: torch.Tensor, thresholds: np.ndarray | float
-) -> Dict[str, float]:
-    preds_np = preds.detach().cpu().numpy()
-    targets_np = (targets.detach().cpu().numpy() >= 0.5).astype(np.int32)
-    pred_bin = _binarize_predictions(preds_np, thresholds)
-
-    tp = (pred_bin * targets_np).sum()
-    fp = (pred_bin * (1 - targets_np)).sum()
-    fn = ((1 - pred_bin) * targets_np).sum()
-    micro_precision = 0.0 if (tp + fp) == 0 else float(tp) / float(tp + fp)
-    micro_recall = 0.0 if (tp + fn) == 0 else float(tp) / float(tp + fn)
-    micro_f1 = (
-        0.0
-        if (2 * tp + fp + fn) == 0
-        else float(2 * tp) / float(2 * tp + fp + fn)
-    )
-
-    macro_precision = []
-    macro_recall = []
-    macro_f1 = []
-    for idx in range(preds_np.shape[1]):
-        pred_c = pred_bin[:, idx]
-        targ_c = targets_np[:, idx]
-        tp_c = (pred_c * targ_c).sum()
-        fp_c = (pred_c * (1 - targ_c)).sum()
-        fn_c = ((1 - pred_c) * targ_c).sum()
-        prec_c = 0.0 if (tp_c + fp_c) == 0 else float(tp_c) / float(tp_c + fp_c)
-        rec_c = 0.0 if (tp_c + fn_c) == 0 else float(tp_c) / float(tp_c + fn_c)
-        f1_c = (
-            0.0
-            if (2 * tp_c + fp_c + fn_c) == 0
-            else float(2 * tp_c) / float(2 * tp_c + fp_c + fn_c)
-        )
-        macro_precision.append(prec_c)
-        macro_recall.append(rec_c)
-        macro_f1.append(f1_c)
-
-    macro_precision_val = float(np.mean(macro_precision)) if macro_precision else 0.0
-    macro_recall_val = float(np.mean(macro_recall)) if macro_recall else 0.0
-    macro_f1_val = float(np.mean(macro_f1)) if macro_f1 else 0.0
-
-    ntrue = targets_np.sum(axis=1)
-    npred = pred_bin.sum(axis=1)
-    ncorr = (pred_bin & targets_np).sum(axis=1)
-    nmiss = ntrue - ncorr
-    nfa = npred - ncorr
-    denom = ntrue.sum()
-    er = 0.0 if denom == 0 else float(np.maximum(nmiss, nfa).sum()) / float(denom)
-
-    return {
-        "micro_precision": micro_precision,
-        "micro_recall": micro_recall,
-        "micro_f1": micro_f1,
-        "macro_precision": macro_precision_val,
-        "macro_recall": macro_recall_val,
-        "macro_f1": macro_f1_val,
-        "er": er,
-    }
-
-
-def _best_threshold(scores: np.ndarray, targets: np.ndarray) -> float:
-    if scores.size == 0:
-        return 0.5
-    best_thres = float("inf")
-    best_f1 = 0.0
-    instances = [(-np.inf, False)] + sorted(zip(scores.tolist(), targets.tolist()))
-    tp = 0
-    denom = targets.sum()
-    for i in range(len(instances) - 1, 0, -1):
-        if instances[i][1]:
-            tp += 1
-        denom += 1
-        if instances[i][0] > instances[i - 1][0]:
-            f1 = 0.0 if denom == 0 else (2.0 * tp) / denom
-            if f1 > best_f1:
-                best_thres = (instances[i][0] + instances[i - 1][0]) / 2.0
-                best_f1 = f1
-    return best_thres if np.isfinite(best_thres) else 0.5
-
-
-def find_best_global_threshold(preds: torch.Tensor, targets: torch.Tensor) -> float:
-    scores = preds.detach().cpu().numpy().reshape(-1)
-    truth = targets.detach().cpu().numpy().reshape(-1).astype(bool)
-    return _best_threshold(scores, truth)
-
-
-def find_best_per_class_thresholds(preds: torch.Tensor, targets: torch.Tensor) -> np.ndarray:
-    scores = preds.detach().cpu().numpy()
-    truth = targets.detach().cpu().numpy().astype(bool)
-    thresholds = np.zeros(scores.shape[1], dtype=np.float32)
-    for idx in range(scores.shape[1]):
-        thresholds[idx] = _best_threshold(scores[:, idx], truth[:, idx])
-    return thresholds
 
 
 def run_epoch(
@@ -560,7 +189,7 @@ def create_dataloaders(
     Optional[Tuple[Sequence, int, bool]],
 ]:
     anuraset_meta = pd.read_csv(root / "metadata.csv")
-    label_columns = _select_label_columns(anuraset_meta, target_species)
+    label_columns = select_label_columns(anuraset_meta, target_species)
     if dataset_name == "FNJV":
         fnjv_meta = pd.read_csv(fnjv_metadata)
         fnjv_meta = fnjv_meta[fnjv_meta["Code"].notna()]
@@ -750,36 +379,6 @@ def main(args: argparse.Namespace, run_config: RunConfig) -> None:
         history[split]["macro_recall"].append(metrics["macro_recall"])
         history[split]["er"].append(metrics["er"])
 
-    def _plot_history(output_path: Path) -> None:
-        epochs = np.arange(1, len(history["train"]["loss"]) + 1)
-        fig, axes = plt.subplots(4, 2, figsize=(14, 16))
-        axes = axes.flatten()
-
-        def plot_metric(
-            ax, metric: str, title: str, ylim: Optional[Tuple[float, float]] = None
-        ) -> None:
-            ax.plot(epochs, history["train"][metric], label="train")
-            ax.plot(epochs, history["val"][metric], label="val")
-            ax.set_title(title)
-            ax.set_xlabel("Epoch")
-            ax.set_ylabel(metric.replace("_", " "))
-            if ylim is not None:
-                ax.set_ylim(*ylim)
-            ax.grid(True, alpha=0.3)
-            ax.legend()
-
-        plot_metric(axes[0], "loss", "Loss")
-        plot_metric(axes[1], "micro_f1", "Micro F1", ylim=(0.0, 1.0))
-        plot_metric(axes[2], "macro_f1", "Macro F1", ylim=(0.0, 1.0))
-        plot_metric(axes[3], "micro_precision", "Micro Precision", ylim=(0.0, 1.0))
-        plot_metric(axes[4], "micro_recall", "Micro Recall", ylim=(0.0, 1.0))
-        plot_metric(axes[5], "macro_precision", "Macro Precision", ylim=(0.0, 1.0))
-        plot_metric(axes[6], "macro_recall", "Macro Recall", ylim=(0.0, 1.0))
-        plot_metric(axes[7], "er", "Error Rate")
-
-        fig.tight_layout()
-        fig.savefig(output_path)
-        plt.close(fig)
     for epoch in range(1, args.epochs + 1):
         train_loader, train_batches, train_is_gen = train_loader_info
         train_data = train_loader() if train_is_gen else train_loader
@@ -831,7 +430,7 @@ def main(args: argparse.Namespace, run_config: RunConfig) -> None:
         if val_metrics["macro_f1"] > best_macro:
             best_macro = val_metrics["macro_f1"]
             torch.save(model.state_dict(), best_macro_path)
-        _plot_history(plot_path)
+        plot_history(history, plot_path)
 
     print("Training finished. Best micro-F1: {:.4f}".format(best_f1))
     print("Training finished. Best macro-F1: {:.4f}".format(best_macro))
