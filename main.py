@@ -160,10 +160,10 @@ class AnuraSetDataset(Dataset):
         label_columns: Sequence[str],
         subset: Optional[str] = None,
         file_filter: Optional[Set[Tuple[str, str]]] = None,
-        sample_rate: int,
-        fps: float,
-        n_mels: int,
-        n_fft: int,
+        sample_rate: int = 22000,
+        fps: float = 40.0,
+        n_mels: int = 64,
+        n_fft: int = 1100,
         clip_duration: int = 60,
     ) -> None:
         super().__init__()
